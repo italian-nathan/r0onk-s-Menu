@@ -1,0 +1,4578 @@
+-- r0onk's Menu
+-- Default: RightAlt menu, F fly, N noclip, J infinite jump, T aimbot
+-- Fly movement: WASD + Space / LeftAlt
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Teams = game:GetService("Teams")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local CoreGui = game:GetService("CoreGui")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+local ENH = {}
+
+-- A new execution cleanly unloads a previous Enhanced build first.
+ENH.Env = (type(getgenv) == "function" and getgenv()) or _G
+if type(ENH.Env.r0onk_Unload) == "function" then
+	pcall(ENH.Env.r0onk_Unload)
+end
+
+-- ===== CONFIG =====
+local CONFIG = {
+	Keys = {
+		Open = Enum.KeyCode.RightAlt,
+		Fly = Enum.KeyCode.F,
+		Noclip = Enum.KeyCode.N,
+		InfJump = Enum.KeyCode.J,
+		Aimbot = Enum.KeyCode.T,
+	},
+
+	FlySpeed = {
+		Min = 1,
+		Max = 1337,
+		Default = 60,
+	},
+
+	WalkSpeed = {
+		Min = 1,
+		Max = 1337,
+		Default = 16,
+	},
+
+	JumpPower = {
+		Min = 1,
+		Max = 1337,
+		Default = 50,
+	},
+
+	GhostSpeed = 60,
+	InfJumpCooldown = 0.18,
+	InfJumpImpulse = 52,
+	AttackWindow = 0.15,
+
+	TeleportOffset = CFrame.new(0, 0, -3),
+	BringOffset = CFrame.new(0, 0, -4),
+
+	PanelWidth = 460,
+	PanelHeight = 520,
+	HeaderHeight = 62,
+
+	ESP = {
+		MaxDistanceMin = 50,
+		MaxDistanceMax = 10000,
+		MaxDistanceDefault = 10000,
+	},
+
+	AIMLOCK = {
+		MaxDistanceMin = 10,
+		MaxDistanceMax = 10000,
+		MaxDistanceDefault = 500,
+		FOVDegrees = 180,
+	},
+}
+
+local THEME = {
+	BG = Color3.fromRGB(32, 34, 40),
+	PANEL = Color3.fromRGB(42, 45, 54),
+	BUTTON = Color3.fromRGB(52, 56, 68),
+	BUTTON_ACTIVE = Color3.fromRGB(0, 140, 255),
+	TEXT = Color3.fromRGB(235, 235, 235),
+	SUBTEXT = Color3.fromRGB(170, 170, 170),
+	ACCENT = Color3.fromRGB(0, 255, 120),
+	OUTLINE = Color3.fromRGB(70, 70, 80),
+	DANGER = Color3.fromRGB(220, 60, 60),
+	HP_GOOD = Color3.fromRGB(80, 255, 120),
+	HP_BAD = Color3.fromRGB(255, 60, 60),
+	ESP_ENEMY = Color3.fromRGB(255, 80, 80),
+	ESP_TEAM = Color3.fromRGB(80, 160, 255),
+	ESP_NEUTRAL = Color3.fromRGB(255, 255, 255),
+}
+
+-- ===== PERSISTENT PREFERENCES =====
+-- Preferences are optional: the menu still works normally if the executor does
+-- not provide readfile/writefile/isfile. Active toggles are intentionally NOT saved.
+ENH.SettingsFile = "r0onk_menu_settings_v2.json"
+ENH.CanPersist = type(readfile) == "function" and type(writefile) == "function"
+ENH.AllSettings = { version = 2, global = {}, games = {} }
+
+if ENH.CanPersist then
+	pcall(function()
+		local exists = type(isfile) ~= "function" or isfile(ENH.SettingsFile)
+		if exists then
+			local decoded = HttpService:JSONDecode(readfile(ENH.SettingsFile))
+			if type(decoded) == "table" then ENH.AllSettings = decoded end
+		end
+	end)
+end
+
+ENH.AllSettings.version = 2
+ENH.AllSettings.global = type(ENH.AllSettings.global) == "table" and ENH.AllSettings.global or {}
+ENH.AllSettings.games = type(ENH.AllSettings.games) == "table" and ENH.AllSettings.games or {}
+do
+	local placeKey = tostring(game.PlaceId)
+	ENH.AllSettings.games[placeKey] = type(ENH.AllSettings.games[placeKey]) == "table" and ENH.AllSettings.games[placeKey] or {}
+	ENH.GamePrefs = ENH.AllSettings.games[placeKey]
+end
+
+do
+	local function enumKeyFromName(name, fallback)
+		if type(name) == "string" then
+			local ok, value = pcall(function() return Enum.KeyCode[name] end)
+			if ok and value then return value end
+		end
+		return fallback
+	end
+
+	local savedKeys = type(ENH.AllSettings.global.Keys) == "table" and ENH.AllSettings.global.Keys or {}
+	for action, fallback in pairs(CONFIG.Keys) do
+		CONFIG.Keys[action] = enumKeyFromName(savedKeys[action], fallback)
+	end
+end
+
+-- ===== STATE =====
+local alive = true
+local character = nil
+local humanoid = nil
+local hrp = nil
+
+local flySpeed = tonumber(ENH.GamePrefs.FlySpeed) or CONFIG.FlySpeed.Default
+local walkSpeed = tonumber(ENH.GamePrefs.WalkSpeedOverride) or CONFIG.WalkSpeed.Default
+local jumpPower = tonumber(ENH.GamePrefs.JumpPowerOverride) or CONFIG.JumpPower.Default
+ENH.WalkSpeedLocked = ENH.GamePrefs.WalkSpeedOverride ~= nil
+ENH.JumpPowerLocked = ENH.GamePrefs.JumpPowerOverride ~= nil
+ENH.GameWalkSpeedBaseline = nil
+ENH.GameJumpPowerBaseline = nil
+ENH.GameUseJumpPowerBaseline = nil
+
+local flying = false
+local noclip = false
+local infJump = false
+local espEnabled = false
+local espMode = tostring(ENH.GamePrefs.ESPMode or "ENEMIES")
+if espMode ~= "ALL" and espMode ~= "TEAM" and espMode ~= "ENEMIES" then espMode = "ENEMIES" end
+local espHealthBars = ENH.GamePrefs.ESPHealthBars ~= false
+local espNameTags = ENH.GamePrefs.ESPNameTags ~= false
+local espDistanceTags = ENH.GamePrefs.ESPDistanceTags ~= false
+local espTeamColors = ENH.GamePrefs.ESPTeamColors ~= false
+local espMaxDistance = tonumber(ENH.GamePrefs.ESPMaxDistance) or CONFIG.ESP.MaxDistanceDefault
+
+-- Aimlock is integrated into the Combat section.
+local aimLockEnabled = false
+local aimCurrentTarget = nil
+local aimMaxDistance = tonumber(ENH.GamePrefs.AimMaxDistance) or CONFIG.AIMLOCK.MaxDistanceDefault
+
+-- Only explicit user choices are stored here.
+-- Teams without an override fall back to the familiar behavior:
+-- enemies targetable, own team ignored. Player.Neutral is treated as the
+-- separate "Neutral / No Team" bucket even if Team is still populated.
+local aimTeamOverrides = type(ENH.GamePrefs.AimTeamOverrides) == "table" and ENH.GamePrefs.AimTeamOverrides or {}
+
+local infLast = 0
+local infArmed = true
+
+local activeAction = "TELEPORT"
+local bringingTargets = {}
+
+local connections = {}
+local perCharacterConnections = {}
+local playerHooks = {}
+ENH.DynamicPlayerConnections = {}
+ENH.DynamicAimTeamConnections = {}
+ENH.PlayerSearchQuery = ""
+ENH.PlayerFilterMode = "ALL"
+ENH.PlayerSearchBox = nil
+ENH.PlayerFilterButtons = {}
+ENH.KeybindButtons = {}
+ENH.KeybindStatusLabel = nil
+ENH.HeaderHintLabel = nil
+ENH.CapturingKeybind = false
+ENH.KeyCaptureConnection = nil
+ENH.WalkSpeedControlSetter = nil
+ENH.JumpPowerControlSetter = nil
+
+-- ===== CONNECTION HELPERS =====
+local function track(conn, bucket)
+	if conn then
+		table.insert(bucket or connections, conn)
+	end
+	return conn
+end
+
+local function disconnectBucket(bucket)
+	for _, conn in ipairs(bucket) do
+		if conn then
+			conn:Disconnect()
+		end
+	end
+	table.clear(bucket)
+end
+
+local function typingInTextBox()
+	return UserInputService:GetFocusedTextBox() ~= nil
+end
+
+local function keyToText(key)
+	if key == Enum.KeyCode.Backquote then
+		return "`"
+	end
+
+	local name = key.Name
+	name = name:gsub("LeftControl", "Ctrl")
+	name = name:gsub("RightControl", "Ctrl")
+	name = name:gsub("LeftAlt", "Alt")
+	name = name:gsub("RightAlt", "Alt")
+	name = name:gsub("LeftShift", "Shift")
+	name = name:gsub("RightShift", "Shift")
+	return name
+end
+
+local function clampInt(v, minValue, maxValue)
+	return math.clamp(math.floor(tonumber(v) or minValue), minValue, maxValue)
+end
+
+ENH.SettingsSaveSerial = 0
+local function saveSettingsNow()
+	if not ENH.CanPersist then return end
+
+	ENH.AllSettings.global.Keys = {}
+	for action, key in pairs(CONFIG.Keys) do
+		ENH.AllSettings.global.Keys[action] = key.Name
+	end
+
+	ENH.GamePrefs.FlySpeed = flySpeed
+	ENH.GamePrefs.ESPMode = espMode
+	ENH.GamePrefs.ESPHealthBars = espHealthBars
+	ENH.GamePrefs.ESPNameTags = espNameTags
+	ENH.GamePrefs.ESPDistanceTags = espDistanceTags
+	ENH.GamePrefs.ESPTeamColors = espTeamColors
+	ENH.GamePrefs.ESPMaxDistance = espMaxDistance
+	ENH.GamePrefs.AimMaxDistance = aimMaxDistance
+	ENH.GamePrefs.AimTeamOverrides = aimTeamOverrides
+	ENH.GamePrefs.WalkSpeedOverride = ENH.WalkSpeedLocked and walkSpeed or nil
+	ENH.GamePrefs.JumpPowerOverride = ENH.JumpPowerLocked and jumpPower or nil
+
+	pcall(function()
+		writefile(ENH.SettingsFile, HttpService:JSONEncode(ENH.AllSettings))
+	end)
+end
+
+local function scheduleSaveSettings()
+	if not ENH.CanPersist then return end
+	ENH.SettingsSaveSerial += 1
+	local serial = ENH.SettingsSaveSerial
+	task.delay(0.15, function()
+		if alive and serial == ENH.SettingsSaveSerial then
+			saveSettingsNow()
+		end
+	end)
+end
+
+local function refreshHeaderGreeting()
+	if ENH.HeaderHintLabel then
+		ENH.HeaderHintLabel.Text = "Welcome " .. player.Name
+	end
+end
+
+local function getCharacter()
+	return player.Character
+end
+
+local function getHumanoid(char)
+	char = char or getCharacter()
+	return char and char:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function getHRP(char)
+	char = char or getCharacter()
+	if not char then return nil end
+
+	local hum = char:FindFirstChildOfClass("Humanoid") or char:FindFirstChildWhichIsA("Humanoid", true)
+	return (hum and hum.RootPart)
+		or char:FindFirstChild("HumanoidRootPart", true)
+		or char.PrimaryPart
+		or char:FindFirstChild("UpperTorso", true)
+		or char:FindFirstChild("Torso", true)
+		or char:FindFirstChild("LowerTorso", true)
+		or char:FindFirstChild("Head", true)
+end
+
+-- ===== UI ROOT =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "r0onk_Menu"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 999999
+
+local function parentGuiSafely(screenGui)
+	local parent = nil
+
+	pcall(function()
+		if type(gethui) == "function" then
+			parent = gethui()
+		elseif type(get_hidden_gui) == "function" then
+			parent = get_hidden_gui()
+		end
+	end)
+
+	if parent then
+		pcall(function() screenGui.Parent = parent end)
+	end
+
+	if not screenGui.Parent then
+		pcall(function()
+			if syn and type(syn.protect_gui) == "function" then
+				syn.protect_gui(screenGui)
+			end
+			screenGui.Parent = CoreGui
+		end)
+	end
+
+	if not screenGui.Parent then
+		screenGui.Parent = player:WaitForChild("PlayerGui")
+	end
+end
+
+parentGuiSafely(gui)
+
+local espFolder = Instance.new("Folder")
+espFolder.Name = "r0onk_ESP"
+espFolder.Parent = gui
+
+-- ===== FORWARD UI DECLARES =====
+local window
+local frame
+local flyBtn
+local noclipBtn
+local infJumpBtn
+local espBtn
+local espModeBtns = {}
+local espHealthBtn
+local espNameBtn
+local espDistanceBtn
+local espTeamColorBtn
+
+local aimLockBtn
+local aimTargetLabel
+local aimTeamScroll
+local aimTeamButtons = {}
+
+local bringStatusLabel
+local playerListFrame
+local playerListLayout
+local ghostBtn
+local swapBtn
+local currentUIParent = nil
+local setCheckWidget
+
+local function setToggleButton(btn, on, onText, offText)
+	if not btn then return end
+	btn.Text = on and onText or offText
+	btn.BackgroundColor3 = on and THEME.BUTTON_ACTIVE or THEME.BUTTON
+end
+
+local function setToggleWidget(widget, on, labelText)
+	if not widget then return end
+
+	widget.label.Text = labelText
+	widget.track.BackgroundColor3 = on and THEME.BUTTON_ACTIVE or Color3.fromRGB(66, 70, 82)
+
+	if widget.gradient then
+		widget.gradient.Enabled = false
+	end
+
+	widget.thumb.BackgroundColor3 = on and THEME.TEXT or THEME.SUBTEXT
+	widget.thumb.Position = on
+		and UDim2.new(1, -23, 0.5, -9)
+		or UDim2.new(0, 5, 0.5, -9)
+end
+
+-- ===== HUMANOID STATS =====
+local function applyWalkSpeed()
+	local hum = getHumanoid(character)
+	if hum and ENH.WalkSpeedLocked then
+		hum.WalkSpeed = walkSpeed
+	end
+end
+
+local function applyJumpPower()
+	local hum = getHumanoid(character)
+	if not hum or not ENH.JumpPowerLocked then return end
+
+	hum.UseJumpPower = true
+	hum.JumpPower = jumpPower
+end
+
+local function applyHumanoidStats()
+	applyWalkSpeed()
+	applyJumpPower()
+end
+
+local function restoreGameStats(clearSavedOverrides)
+	local hum = getHumanoid(getCharacter())
+	ENH.WalkSpeedLocked = false
+	ENH.JumpPowerLocked = false
+
+	if hum then
+		if ENH.GameWalkSpeedBaseline ~= nil then
+			hum.WalkSpeed = ENH.GameWalkSpeedBaseline
+			walkSpeed = clampInt(ENH.GameWalkSpeedBaseline, CONFIG.WalkSpeed.Min, CONFIG.WalkSpeed.Max)
+		end
+
+		if ENH.GameUseJumpPowerBaseline ~= nil then
+			hum.UseJumpPower = ENH.GameUseJumpPowerBaseline
+		end
+		if ENH.GameJumpPowerBaseline ~= nil then
+			hum.JumpPower = ENH.GameJumpPowerBaseline
+			jumpPower = clampInt(ENH.GameJumpPowerBaseline, CONFIG.JumpPower.Min, CONFIG.JumpPower.Max)
+		end
+	end
+
+	if ENH.WalkSpeedControlSetter then ENH.WalkSpeedControlSetter(walkSpeed, true) end
+	if ENH.JumpPowerControlSetter then ENH.JumpPowerControlSetter(jumpPower, true) end
+
+	if clearSavedOverrides then
+		ENH.GamePrefs.WalkSpeedOverride = nil
+		ENH.GamePrefs.JumpPowerOverride = nil
+		scheduleSaveSettings()
+	end
+end
+
+-- ===== FLY =====
+local flyAttachment
+local flyVelocity
+local flyOrientation
+
+local function cleanupFlyObjects()
+	if flyVelocity then flyVelocity:Destroy() end
+	if flyOrientation then flyOrientation:Destroy() end
+	if flyAttachment then flyAttachment:Destroy() end
+	flyVelocity = nil
+	flyOrientation = nil
+	flyAttachment = nil
+end
+
+local function setFlying(on)
+	flying = on
+
+	if flyVelocity then
+		flyVelocity.Enabled = flying
+		if not flying then
+			flyVelocity.VectorVelocity = Vector3.zero
+		end
+	end
+
+	if flyOrientation then
+		flyOrientation.Enabled = flying
+	end
+
+	setToggleWidget(flyBtn, flying, "Fly")
+end
+
+local function setupFlyObjects(root)
+	cleanupFlyObjects()
+	if not root then return end
+
+	flyAttachment = Instance.new("Attachment")
+	flyAttachment.Name = "r0onk_FlyAttachment"
+	flyAttachment.Parent = root
+
+	flyVelocity = Instance.new("LinearVelocity")
+	flyVelocity.Name = "r0onk_FlyVelocity"
+	flyVelocity.Attachment0 = flyAttachment
+	flyVelocity.MaxForce = math.huge
+	flyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	flyVelocity.Enabled = flying
+	flyVelocity.Parent = root
+
+	flyOrientation = Instance.new("AlignOrientation")
+	flyOrientation.Name = "r0onk_FlyOrientation"
+	flyOrientation.Attachment0 = flyAttachment
+	flyOrientation.MaxTorque = math.huge
+	flyOrientation.Responsiveness = 200
+	flyOrientation.Enabled = flying
+	flyOrientation.Parent = root
+end
+
+-- ===== NOCLIP =====
+local noclipConn
+local savedCollide = {}
+local noclipHeadGuard = { part = nil, conn = nil }
+
+local function saveIfNeeded(part)
+	if savedCollide[part] == nil then
+		-- Keep all three values because the existing attack-window code expects
+		-- this shape, even though normal noclip only changes CanCollide.
+		savedCollide[part] = {
+			part.CanCollide,
+			part.CanTouch,
+			part.CanQuery,
+		}
+	end
+end
+
+local function restorePart(part, old)
+	if part and part.Parent and old then
+		part.CanCollide = old[1]
+		part.CanTouch = old[2]
+		part.CanQuery = old[3]
+	end
+end
+
+local function restoreAllCollisions()
+	for part, old in pairs(savedCollide) do
+		restorePart(part, old)
+	end
+	table.clear(savedCollide)
+end
+
+local function applyNoCollide()
+	-- Use the live Player.Character first so character swaps/morphs do not leave
+	-- noclip enforcing an old model.
+	local char = player.Character or character
+	if not char or not char.Parent then
+		return
+	end
+
+	-- Character body: BasePart covers Part, MeshPart, UnionOperation, etc.
+	local firstBodyPart = nil
+
+	for _, descendant in ipairs(char:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			if not firstBodyPart then
+				firstBodyPart = descendant
+			end
+
+			saveIfNeeded(descendant)
+			descendant.CanCollide = false
+		end
+	end
+
+	-- Also catch a character that is itself represented by a BasePart.
+	if char:IsA("BasePart") then
+		firstBodyPart = char
+		saveIfNeeded(char)
+		char.CanCollide = false
+	end
+
+	-- Roblox's Humanoid/controller can restore Head.CanCollide on some rigs.
+	-- Guard the real head property so if anything flips it back on while noclip
+	-- is active, it is immediately forced off again.
+	local head = char:FindFirstChild("Head", true)
+	if head and head:IsA("BasePart") then
+		saveIfNeeded(head)
+
+		if noclipHeadGuard.part ~= head then
+			if noclipHeadGuard.conn then
+				noclipHeadGuard.conn:Disconnect()
+			end
+
+			noclipHeadGuard.part = head
+			noclipHeadGuard.conn = head:GetPropertyChangedSignal("CanCollide"):Connect(function()
+				if alive and noclip and head.Parent and head.CanCollide then
+					head.CanCollide = false
+				end
+			end)
+		end
+
+		if head.CanCollide then
+			head.CanCollide = false
+		end
+	end
+
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum then
+		hum = char:FindFirstChildWhichIsA("Humanoid", true)
+	end
+
+	-- IMPORTANT:
+	-- Custom hats, morph shells, armor, fake heads, etc. are sometimes welded to
+	-- the player's body while parented OUTSIDE Player.Character. Descendant-only
+	-- noclip misses those. Follow the character's real physics assembly too.
+	local assemblyRoot =
+		(hum and hum.RootPart)
+		or char:FindFirstChild("HumanoidRootPart", true)
+		or char:FindFirstChild("Torso", true)
+		or char:FindFirstChild("UpperTorso", true)
+		or char:FindFirstChild("Head", true)
+		or char.PrimaryPart
+		or firstBodyPart
+
+	if assemblyRoot and assemblyRoot:IsA("BasePart") then
+		local ok, connectedParts = pcall(function()
+			return assemblyRoot:GetConnectedParts(true)
+		end)
+
+		if ok then
+			for _, part in ipairs(connectedParts) do
+				if part:IsA("BasePart") then
+					saveIfNeeded(part)
+					part.CanCollide = false
+				end
+			end
+		end
+	end
+
+	-- Vehicle / seat support.
+	-- Keep this explicit because some vehicle assemblies are not included in the
+	-- character root's connected set until the SeatWeld is fully established.
+	local seat = hum and hum.SeatPart or nil
+	if seat and seat:IsA("BasePart") then
+		saveIfNeeded(seat)
+		seat.CanCollide = false
+
+		local ok, connectedParts = pcall(function()
+			return seat:GetConnectedParts(true)
+		end)
+
+		if ok then
+			for _, part in ipairs(connectedParts) do
+				if part:IsA("BasePart") then
+					saveIfNeeded(part)
+					part.CanCollide = false
+				end
+			end
+		end
+	end
+end
+
+local function startNoclipLoop()
+	if noclipConn then
+		return
+	end
+
+	-- PreSimulation runs immediately before physics. That makes the local
+	-- collision state authoritative for the frame even if another local
+	-- controller changed CanCollide earlier in the frame.
+	noclipConn = RunService.PreSimulation:Connect(function()
+		if alive and noclip then
+			applyNoCollide()
+		end
+	end)
+end
+
+local function stopNoclipLoop()
+	if noclipConn then
+		noclipConn:Disconnect()
+		noclipConn = nil
+	end
+
+	if noclipHeadGuard.conn then
+		noclipHeadGuard.conn:Disconnect()
+		noclipHeadGuard.conn = nil
+	end
+	noclipHeadGuard.part = nil
+end
+
+local function setNoclip(on)
+	noclip = on
+
+	if noclip then
+		-- Restore any stale snapshot first, then take a clean snapshot of the
+		-- current character/vehicle before forcing collision off.
+		restoreAllCollisions()
+		applyNoCollide()
+		startNoclipLoop()
+	else
+		stopNoclipLoop()
+		restoreAllCollisions()
+	end
+
+	setToggleWidget(noclipBtn, noclip, "Noclip")
+end
+
+
+-- ===== ATTACK WINDOW FOR NOCLIP =====
+local attackDebounce = false
+
+local function hrpSafeToEnable()
+	local root = getHRP(character)
+	if not root then return false end
+
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+	params.FilterDescendantsInstances = { character }
+
+	local touching = workspace:GetPartsInPart(root, params)
+	return #touching == 0
+end
+
+local function doAttackWindow()
+	if not noclip or attackDebounce then return end
+
+	local root = getHRP(character)
+	if not root then return end
+	if not hrpSafeToEnable() then return end
+
+	attackDebounce = true
+
+	local old = savedCollide[root] or { root.CanCollide, root.CanTouch, root.CanQuery }
+	root.CanCollide = true
+	root.CanTouch = true
+	root.CanQuery = true
+
+	task.delay(CONFIG.AttackWindow, function()
+		if noclip and root and root.Parent then
+			root.CanCollide = false
+			root.CanTouch = false
+			root.CanQuery = false
+		elseif root and root.Parent then
+			root.CanCollide = old[1]
+			root.CanTouch = old[2]
+			root.CanQuery = old[3]
+		end
+
+		attackDebounce = false
+	end)
+end
+
+local function hookTool(tool)
+	if not tool:IsA("Tool") then return end
+	track(tool.Activated:Connect(doAttackWindow), perCharacterConnections)
+end
+
+local function hookCharacterTools(char)
+	track(char.ChildAdded:Connect(hookTool), perCharacterConnections)
+	for _, child in ipairs(char:GetChildren()) do
+		hookTool(child)
+	end
+end
+
+-- ===== TELEPORT / BRING =====
+local bringConn
+
+local function getCharacterPivotSafe(char)
+	if not char or not char.Parent then return nil end
+	local ok, pivot = pcall(function() return char:GetPivot() end)
+	if ok then return pivot end
+	local root = getHRP(char)
+	return root and root.CFrame or nil
+end
+
+local function teleportToPlayer(targetPlayer)
+	local myChar = getCharacter()
+	local targetChar = targetPlayer and targetPlayer.Character
+	if not myChar or not targetChar then return end
+
+	local targetPivot = getCharacterPivotSafe(targetChar)
+	if not targetPivot then return end
+
+	if workspace.StreamingEnabled and type(player.RequestStreamAroundAsync) == "function" then
+		task.spawn(function()
+			pcall(player.RequestStreamAroundAsync, player, targetPivot.Position, 3)
+		end)
+	end
+
+	pcall(function()
+		myChar:PivotTo(targetPivot * CONFIG.TeleportOffset)
+	end)
+end
+
+local function updateBringStatus()
+	if not bringStatusLabel then return end
+
+	if activeAction == "TELEPORT" then
+		bringStatusLabel.Text = "Click a player to teleport behind them."
+		return
+	end
+
+	local names = {}
+	for targetPlayer in pairs(bringingTargets) do
+		table.insert(names, targetPlayer.Name)
+	end
+	table.sort(names)
+
+	if #names == 0 then
+		bringStatusLabel.Text = "Bring mode: click players to add/remove them."
+	elseif #names <= 3 then
+		bringStatusLabel.Text = "Bringing: " .. table.concat(names, ", ")
+	else
+		bringStatusLabel.Text = "Bringing " .. #names .. " players."
+	end
+end
+
+local function stopBringingAll()
+	if bringConn then
+		bringConn:Disconnect()
+		bringConn = nil
+	end
+
+	table.clear(bringingTargets)
+	updateBringStatus()
+end
+
+local function ensureBringLoop()
+	if bringConn then return end
+
+	bringConn = RunService.RenderStepped:Connect(function()
+		if not alive then return end
+
+		local myChar = getCharacter()
+		local myRoot = getHRP(myChar)
+		if not myChar or not myRoot then return end
+
+		for targetPlayer in pairs(bringingTargets) do
+			local targetChar = targetPlayer.Character
+			if targetChar and targetChar.Parent then
+				pcall(function()
+					targetChar:PivotTo(myRoot.CFrame * CONFIG.BringOffset)
+				end)
+			end
+		end
+	end)
+end
+
+local function toggleBringing(targetPlayer)
+	if bringingTargets[targetPlayer] then
+		bringingTargets[targetPlayer] = nil
+	else
+		bringingTargets[targetPlayer] = true
+		ensureBringLoop()
+	end
+
+	updateBringStatus()
+end
+
+local function bringMatchingPlayers(predicate)
+	for _, targetPlayer in ipairs(Players:GetPlayers()) do
+		if targetPlayer ~= player and (not predicate or predicate(targetPlayer)) then
+			bringingTargets[targetPlayer] = true
+		end
+	end
+
+	if next(bringingTargets) then ensureBringLoop() end
+	updateBringStatus()
+end
+
+local function bringAllPlayers()
+	bringMatchingPlayers(nil)
+end
+
+local function bringEnemyPlayers()
+	bringMatchingPlayers(function(targetPlayer)
+		if #Teams:GetTeams() == 0 then return true end
+		if player.Neutral or targetPlayer.Neutral then return true end
+		return targetPlayer.Team ~= player.Team
+	end)
+end
+
+-- ===== ESP / HEALTH BARS =====
+local espByPlayer = {}
+local hpBars = {}
+local nameTags = {} -- Kept for compatibility; names now live inside hpBars BillboardGuis.
+
+local function teamsInUse()
+	return #Teams:GetTeams() > 0
+end
+
+local function isEnemy(otherPlayer)
+	if otherPlayer == player then return false end
+	if not teamsInUse() then return true end
+	if player.Neutral or otherPlayer.Neutral then return true end
+	return otherPlayer.Team ~= player.Team
+end
+
+local function isTeammate(otherPlayer)
+	if otherPlayer == player then return false end
+	if not teamsInUse() then return false end
+	if player.Neutral or otherPlayer.Neutral then return false end
+	return otherPlayer.Team == player.Team
+end
+
+local function shouldShow(otherPlayer)
+	if otherPlayer == player then return false end
+	if not espEnabled then return false end
+	if espMode == "ALL" then return true end
+	if espMode == "ENEMIES" then return isEnemy(otherPlayer) end
+	if espMode == "TEAM" then return isTeammate(otherPlayer) end
+	return false
+end
+
+local function getESPDistance(otherPlayer)
+	local myRoot = getHRP(getCharacter())
+	local theirRoot = getHRP(otherPlayer.Character)
+	if not myRoot or not theirRoot then return nil end
+	return (myRoot.Position - theirRoot.Position).Magnitude
+end
+
+local function passesESPDistance(otherPlayer)
+	local dist = getESPDistance(otherPlayer)
+	return not dist or dist <= espMaxDistance
+end
+
+local function outlineColorFor(otherPlayer)
+	if espTeamColors and otherPlayer.TeamColor then
+		return otherPlayer.TeamColor.Color
+	end
+
+	if isTeammate(otherPlayer) then
+		return THEME.ESP_TEAM
+	end
+
+	if isEnemy(otherPlayer) then
+		return THEME.ESP_ENEMY
+	end
+
+	return THEME.ESP_NEUTRAL
+end
+
+local function removeHealthBar(otherPlayer)
+	local bar = hpBars[otherPlayer]
+	if bar then
+		bar:Destroy()
+		hpBars[otherPlayer] = nil
+	end
+end
+
+local function removeNameTag(otherPlayer)
+	local tag = nameTags[otherPlayer]
+	if tag then
+		tag:Destroy()
+		nameTags[otherPlayer] = nil
+	end
+end
+
+local function removeESP(otherPlayer)
+	local highlight = espByPlayer[otherPlayer]
+	if highlight then
+		highlight:Destroy()
+		espByPlayer[otherPlayer] = nil
+	end
+
+	removeHealthBar(otherPlayer)
+	removeNameTag(otherPlayer)
+end
+
+local function ensureESP(otherPlayer)
+	if not shouldShow(otherPlayer) or not passesESPDistance(otherPlayer) then
+		removeESP(otherPlayer)
+		return
+	end
+
+	local char = otherPlayer.Character
+	if not char then
+		removeESP(otherPlayer)
+		return
+	end
+
+	local highlight = espByPlayer[otherPlayer]
+	if not highlight then
+		highlight = Instance.new("Highlight")
+		highlight.Name = "ESP_" .. otherPlayer.Name
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.FillTransparency = 1
+		highlight.OutlineTransparency = 0
+		highlight.Parent = espFolder
+		espByPlayer[otherPlayer] = highlight
+	end
+
+	highlight.Adornee = char
+	highlight.OutlineColor = outlineColorFor(otherPlayer)
+end
+
+local function ensurePlayerTag(otherPlayer)
+	local showText = espNameTags or espDistanceTags
+	local showHealth = espHealthBars
+
+	if not showText and not showHealth then
+		removeHealthBar(otherPlayer)
+		return
+	end
+
+	if not shouldShow(otherPlayer) or not passesESPDistance(otherPlayer) then
+		removeHealthBar(otherPlayer)
+		return
+	end
+
+	local char = otherPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local head = char and char:FindFirstChild("Head")
+
+	if not hum or not head then
+		removeHealthBar(otherPlayer)
+		return
+	end
+
+	local tag = hpBars[otherPlayer]
+	if not tag then
+		tag = Instance.new("BillboardGui")
+		tag.Name = "PlayerTag_" .. otherPlayer.Name
+		tag.Size = UDim2.fromOffset(180, 34)
+		tag.StudsOffset = Vector3.new(0, 3.25, 0)
+		tag.AlwaysOnTop = true
+		tag.MaxDistance = espMaxDistance
+		tag.LightInfluence = 0
+		tag.Parent = espFolder
+		hpBars[otherPlayer] = tag
+
+		local nameText = Instance.new("TextLabel")
+		nameText.Name = "NameText"
+		nameText.Size = UDim2.new(1, 0, 0, 16)
+		nameText.Position = UDim2.fromOffset(0, 0)
+		nameText.BackgroundTransparency = 1
+		nameText.Font = Enum.Font.GothamMedium
+		nameText.TextSize = 13
+		nameText.TextColor3 = Color3.fromRGB(255, 255, 255)
+		nameText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+		nameText.TextStrokeTransparency = 0.25
+		nameText.TextXAlignment = Enum.TextXAlignment.Center
+		nameText.ZIndex = 10
+		nameText.Parent = tag
+
+		local bg = Instance.new("Frame")
+		bg.Name = "BG"
+		bg.Size = UDim2.fromOffset(100, 12)
+		bg.Position = UDim2.new(0.5, -50, 0, 19)
+		bg.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+		bg.BackgroundTransparency = 0.05
+		bg.BorderSizePixel = 0
+		bg.ClipsDescendants = true
+		bg.ZIndex = 2
+		bg.Parent = tag
+		Instance.new("UICorner", bg).CornerRadius = UDim.new(1, 0)
+
+		local missing = Instance.new("Frame")
+		missing.Name = "Missing"
+		missing.Size = UDim2.fromScale(1, 1)
+		missing.BackgroundColor3 = THEME.HP_BAD
+		missing.BorderSizePixel = 0
+		missing.ZIndex = 3
+		missing.Parent = bg
+		Instance.new("UICorner", missing).CornerRadius = UDim.new(1, 0)
+
+		local fill = Instance.new("Frame")
+		fill.Name = "Fill"
+		fill.Size = UDim2.fromScale(1, 1)
+		fill.BackgroundColor3 = THEME.HP_GOOD
+		fill.BorderSizePixel = 0
+		fill.ZIndex = 4
+		fill.Parent = bg
+		Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+		-- Health number is inside the bar and has the highest ZIndex,
+		-- so it always draws over both the green fill and red missing-health area.
+		local hpText = Instance.new("TextLabel")
+		hpText.Name = "HPText"
+		hpText.Size = UDim2.fromScale(1, 1)
+		hpText.Position = UDim2.fromOffset(0, -1)
+		hpText.BackgroundTransparency = 1
+		hpText.Font = Enum.Font.GothamBold
+		hpText.TextSize = 10
+		hpText.TextColor3 = Color3.fromRGB(255, 255, 255)
+		hpText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+		hpText.TextStrokeTransparency = 0.1
+		hpText.TextXAlignment = Enum.TextXAlignment.Center
+		hpText.TextYAlignment = Enum.TextYAlignment.Center
+		hpText.ZIndex = 20
+		hpText.Parent = bg
+	end
+
+	tag.Adornee = head
+	tag.MaxDistance = espMaxDistance
+
+	local nameText = tag:FindFirstChild("NameText")
+	local bg = tag:FindFirstChild("BG")
+	local fill = bg and bg:FindFirstChild("Fill")
+	local hpText = bg and bg:FindFirstChild("HPText")
+
+	local parts = {}
+	if espNameTags then
+		table.insert(parts, otherPlayer.Name)
+	end
+
+	if espDistanceTags then
+		local dist = getESPDistance(otherPlayer)
+		if dist then
+			table.insert(parts, "[" .. math.floor(dist) .. " studs]")
+		end
+	end
+
+	if nameText then
+		nameText.Text = table.concat(parts, " ")
+		nameText.TextColor3 = outlineColorFor(otherPlayer)
+		nameText.Visible = showText
+	end
+
+	local hp = math.max(hum.Health, 0)
+	local maxHp = math.max(hum.MaxHealth, 1)
+	local percent = math.clamp(hp / maxHp, 0, 1)
+
+	if bg then
+		bg.Visible = showHealth
+	end
+
+	if fill then
+		fill.Size = UDim2.new(percent, 0, 1, 0)
+	end
+
+	if hpText then
+		hpText.Text = math.floor(hp) .. " / " .. math.floor(maxHp)
+		hpText.Visible = showHealth
+	end
+end
+
+local function refreshPlayerESP(otherPlayer)
+	if otherPlayer == player then return end
+	ensureESP(otherPlayer)
+	ensurePlayerTag(otherPlayer)
+end
+
+local function refreshAllESP()
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		refreshPlayerESP(otherPlayer)
+	end
+end
+
+local function setESPEnabled(on)
+	espEnabled = on
+
+	if not espEnabled then
+		for otherPlayer in pairs(espByPlayer) do
+			removeESP(otherPlayer)
+		end
+
+		for otherPlayer in pairs(hpBars) do
+			removeHealthBar(otherPlayer)
+		end
+	else
+		refreshAllESP()
+	end
+end
+
+local function setESPMode(mode)
+	espMode = mode
+	if espEnabled then
+		refreshAllESP()
+	end
+end
+
+local function updateESPButtons()
+	-- Main ESP control stays as the original switch.
+	setToggleWidget(espBtn, espEnabled, "ESP")
+
+	-- Mode choices act like radio buttons: exactly one selected.
+	for mode, widget in pairs(espModeBtns) do
+		setCheckWidget(widget, espMode == mode)
+	end
+
+	-- The four display options use square checkboxes.
+	setCheckWidget(espHealthBtn, espHealthBars)
+	setCheckWidget(espNameBtn, espNameTags)
+	setCheckWidget(espDistanceBtn, espDistanceTags)
+	setCheckWidget(espTeamColorBtn, espTeamColors)
+end
+
+local function hookPlayer(otherPlayer)
+	if otherPlayer == player then return end
+	if playerHooks[otherPlayer] then return end
+
+	local bucket = {}
+	playerHooks[otherPlayer] = bucket
+
+	track(otherPlayer.CharacterAdded:Connect(function()
+		task.defer(function()
+			refreshPlayerESP(otherPlayer)
+		end)
+	end), bucket)
+
+	track(otherPlayer:GetPropertyChangedSignal("Team"):Connect(function()
+		refreshPlayerESP(otherPlayer)
+	end), bucket)
+
+	track(otherPlayer:GetPropertyChangedSignal("Neutral"):Connect(function()
+		refreshPlayerESP(otherPlayer)
+	end), bucket)
+
+	track(otherPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
+		refreshPlayerESP(otherPlayer)
+	end), bucket)
+
+	refreshPlayerESP(otherPlayer)
+end
+
+local function unhookPlayer(otherPlayer)
+	if playerHooks[otherPlayer] then
+		disconnectBucket(playerHooks[otherPlayer])
+		playerHooks[otherPlayer] = nil
+	end
+
+	bringingTargets[otherPlayer] = nil
+	removeESP(otherPlayer)
+	updateBringStatus()
+end
+
+-- ===== GHOST MODE =====
+local ghostEnabled = false
+local bodyAtGhost = false
+local ghostModel
+local ghostHum
+local ghostRoot
+local ghostConn
+local bodyLockConn
+local bodySafeCF
+
+local function setBodyLocked(locked)
+	local root = getHRP(getCharacter())
+	local hum = getHumanoid(getCharacter())
+	if not root or not hum then return end
+
+	root.Anchored = locked
+	hum.PlatformStand = locked
+end
+
+local function stopBodyLockLoop()
+	if bodyLockConn then
+		bodyLockConn:Disconnect()
+		bodyLockConn = nil
+	end
+end
+
+local function startBodyLockLoop()
+	if bodyLockConn then return end
+
+	bodyLockConn = RunService.Heartbeat:Connect(function()
+		if not alive or not ghostEnabled or bodyAtGhost then return end
+
+		local root = getHRP(getCharacter())
+		if root and bodySafeCF then
+			root.CFrame = bodySafeCF
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end
+	end)
+end
+
+local function destroyGhost()
+	if ghostConn then
+		ghostConn:Disconnect()
+		ghostConn = nil
+	end
+
+	if ghostModel then
+		ghostModel:Destroy()
+		ghostModel = nil
+		ghostHum = nil
+		ghostRoot = nil
+	end
+end
+
+local function createGhostAt(cf)
+	destroyGhost()
+
+	ghostModel = Instance.new("Model")
+	ghostModel.Name = "r0onk_Ghost"
+
+	ghostRoot = Instance.new("Part")
+	ghostRoot.Name = "HumanoidRootPart"
+	ghostRoot.Size = Vector3.new(2, 2, 1)
+	ghostRoot.Transparency = 1
+	ghostRoot.Anchored = true
+	ghostRoot.CanCollide = false
+	ghostRoot.CanTouch = false
+	ghostRoot.CanQuery = false
+	ghostRoot.CFrame = cf
+	ghostRoot.Parent = ghostModel
+
+	ghostHum = Instance.new("Humanoid")
+	ghostHum.Name = "Humanoid"
+	ghostHum.WalkSpeed = 0
+	ghostHum.JumpPower = 0
+	ghostHum.Parent = ghostModel
+
+	ghostModel.PrimaryPart = ghostRoot
+	ghostModel.Parent = workspace
+
+	camera = workspace.CurrentCamera
+	camera.CameraType = Enum.CameraType.Custom
+	camera.CameraSubject = ghostHum
+end
+
+local function startGhostMovementLoop()
+	if ghostConn then return end
+
+	ghostConn = RunService.RenderStepped:Connect(function(dt)
+		if not alive or not ghostEnabled or bodyAtGhost then return end
+		if typingInTextBox() then return end
+		if not ghostRoot or not ghostRoot.Parent then return end
+
+		local cam = workspace.CurrentCamera
+		local dir = Vector3.zero
+
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) then dir -= Vector3.yAxis end
+
+		if dir.Magnitude > 0 then
+			dir = dir.Unit
+		end
+
+		ghostRoot.CFrame = ghostRoot.CFrame + (dir * CONFIG.GhostSpeed * math.clamp(dt, 0, 1 / 30))
+	end)
+end
+
+local function refreshGhostUI()
+	setToggleWidget(ghostBtn, ghostEnabled, "Ghost / Freecam Body")
+
+	if not swapBtn then return end
+
+	swapBtn.BackgroundColor3 = ghostEnabled and THEME.BUTTON_ACTIVE or THEME.PANEL
+	swapBtn.TextColor3 = ghostEnabled and THEME.TEXT or THEME.SUBTEXT
+	swapBtn.Text = bodyAtGhost and "RETURN TO SAVED BODY" or "SWAP BODY ↔ GHOST"
+end
+
+local function enableGhostMode()
+	local root = getHRP(getCharacter())
+	if not root then return end
+
+	if flying then
+		setFlying(false)
+	end
+
+	bodySafeCF = root.CFrame
+	bodyAtGhost = false
+	setBodyLocked(true)
+	startBodyLockLoop()
+	createGhostAt(root.CFrame)
+	startGhostMovementLoop()
+end
+
+local function disableGhostMode()
+	bodyAtGhost = false
+	stopBodyLockLoop()
+	setBodyLocked(false)
+
+	local hum = getHumanoid(getCharacter())
+	if hum then
+		camera = workspace.CurrentCamera
+		camera.CameraType = Enum.CameraType.Custom
+		camera.CameraSubject = hum
+	end
+
+	destroyGhost()
+	bodySafeCF = nil
+end
+
+local function setGhostMode(on)
+	ghostEnabled = on
+	if ghostEnabled then
+		enableGhostMode()
+	else
+		disableGhostMode()
+	end
+	refreshGhostUI()
+end
+
+local function swapBodyGhost()
+	if not ghostEnabled then return end
+	if not ghostRoot or not ghostRoot.Parent then return end
+
+	local root = getHRP(getCharacter())
+	local hum = getHumanoid(getCharacter())
+	if not root or not hum then return end
+	if not bodySafeCF then bodySafeCF = root.CFrame end
+
+	camera = workspace.CurrentCamera
+
+	if not bodyAtGhost then
+		stopBodyLockLoop()
+		root.CFrame = ghostRoot.CFrame
+		setBodyLocked(false)
+		camera.CameraType = Enum.CameraType.Custom
+		camera.CameraSubject = hum
+		bodyAtGhost = true
+	else
+		root.CFrame = bodySafeCF
+		setBodyLocked(true)
+		startBodyLockLoop()
+		camera.CameraType = Enum.CameraType.Custom
+		camera.CameraSubject = ghostHum
+		bodyAtGhost = false
+	end
+
+	refreshGhostUI()
+end
+
+-- ===== CHARACTER SETUP =====
+local function setupCharacter(char)
+	disconnectBucket(perCharacterConnections)
+
+	character = char
+	humanoid = char:WaitForChild("Humanoid", 10) or char:FindFirstChildWhichIsA("Humanoid", true)
+	if not humanoid then return end
+
+	-- Capture whatever the game currently wants before applying user overrides.
+	ENH.GameWalkSpeedBaseline = humanoid.WalkSpeed
+	ENH.GameJumpPowerBaseline = humanoid.JumpPower
+	ENH.GameUseJumpPowerBaseline = humanoid.UseJumpPower
+
+	if not ENH.WalkSpeedLocked then
+		walkSpeed = clampInt(ENH.GameWalkSpeedBaseline, CONFIG.WalkSpeed.Min, CONFIG.WalkSpeed.Max)
+		if ENH.WalkSpeedControlSetter then ENH.WalkSpeedControlSetter(walkSpeed, true) end
+	end
+
+	if not ENH.JumpPowerLocked then
+		jumpPower = clampInt(ENH.GameJumpPowerBaseline, CONFIG.JumpPower.Min, CONFIG.JumpPower.Max)
+		if ENH.JumpPowerControlSetter then ENH.JumpPowerControlSetter(jumpPower, true) end
+	end
+
+	track(humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+		if not humanoid then return end
+		if ENH.WalkSpeedLocked then
+			if humanoid.WalkSpeed ~= walkSpeed then humanoid.WalkSpeed = walkSpeed end
+		else
+			ENH.GameWalkSpeedBaseline = humanoid.WalkSpeed
+			walkSpeed = clampInt(humanoid.WalkSpeed, CONFIG.WalkSpeed.Min, CONFIG.WalkSpeed.Max)
+			if ENH.WalkSpeedControlSetter then ENH.WalkSpeedControlSetter(walkSpeed, true) end
+		end
+	end), perCharacterConnections)
+
+	track(humanoid:GetPropertyChangedSignal("JumpPower"):Connect(function()
+		if not humanoid then return end
+		if ENH.JumpPowerLocked then
+			if humanoid.JumpPower ~= jumpPower then humanoid.JumpPower = jumpPower end
+		else
+			ENH.GameJumpPowerBaseline = humanoid.JumpPower
+			jumpPower = clampInt(humanoid.JumpPower, CONFIG.JumpPower.Min, CONFIG.JumpPower.Max)
+			if ENH.JumpPowerControlSetter then ENH.JumpPowerControlSetter(jumpPower, true) end
+		end
+	end), perCharacterConnections)
+
+	track(humanoid:GetPropertyChangedSignal("UseJumpPower"):Connect(function()
+		if not humanoid then return end
+		if ENH.JumpPowerLocked then
+			if not humanoid.UseJumpPower then humanoid.UseJumpPower = true end
+		else
+			ENH.GameUseJumpPowerBaseline = humanoid.UseJumpPower
+		end
+	end), perCharacterConnections)
+
+	local deadline = os.clock() + 10
+	repeat
+		hrp = getHRP(char)
+		if hrp then break end
+		task.wait()
+	until os.clock() >= deadline or not char.Parent
+
+	setupFlyObjects(hrp)
+	applyHumanoidStats()
+	hookCharacterTools(char)
+
+	if noclip then
+		table.clear(savedCollide)
+		applyNoCollide()
+	end
+
+	if ghostEnabled then
+		task.defer(enableGhostMode)
+	else
+		camera = workspace.CurrentCamera
+		if camera then
+			camera.CameraType = Enum.CameraType.Custom
+			camera.CameraSubject = humanoid
+		end
+		refreshGhostUI()
+	end
+end
+
+-- ===== UI BUILDERS =====
+local ORDER = 0
+local function nextOrder()
+	ORDER += 1
+	return ORDER
+end
+
+local function addCorner(instance, radius)
+	Instance.new("UICorner", instance).CornerRadius = UDim.new(0, radius or 10)
+end
+
+local function makeLabel(text, color, sizeY, textSize)
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, sizeY or 20)
+	label.BackgroundTransparency = 1
+	label.Text = text
+	label.Font = Enum.Font.Gotham
+	label.TextSize = textSize or 14
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextColor3 = color or THEME.TEXT
+	label.ZIndex = 2
+	label.LayoutOrder = nextOrder()
+	label.Parent = currentUIParent or frame
+	return label
+end
+
+local function makeButton(text, height)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, 0, 0, height or 34)
+	button.BackgroundColor3 = THEME.BUTTON
+	button.TextColor3 = THEME.TEXT
+	button.Font = Enum.Font.GothamMedium
+	button.TextSize = 14
+	button.Text = text
+	button.AutoButtonColor = false
+	button.ZIndex = 2
+	button.BorderSizePixel = 0
+	button.LayoutOrder = nextOrder()
+	button.Parent = currentUIParent or frame
+	addCorner(button, 10)
+	return button
+end
+
+local function makeToggleRow(labelText, height)
+	local row = Instance.new("TextButton")
+	row.Size = UDim2.new(1, 0, 0, height or 34)
+	row.BackgroundColor3 = THEME.BUTTON
+	row.Text = ""
+	row.AutoButtonColor = false
+	row.BorderSizePixel = 0
+	row.ZIndex = 2
+	row.LayoutOrder = nextOrder()
+	row.Parent = currentUIParent or frame
+	addCorner(row, 10)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, -84, 1, 0)
+	label.Position = UDim2.new(0, 12, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 13
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextColor3 = THEME.TEXT
+	label.ZIndex = 3
+	label.Parent = row
+
+	local trackFrame = Instance.new("Frame")
+	trackFrame.Size = UDim2.new(0, 54, 0, 24)
+	trackFrame.Position = UDim2.new(1, -66, 0.5, -12)
+	trackFrame.BorderSizePixel = 0
+	trackFrame.BackgroundColor3 = Color3.fromRGB(66, 70, 82)
+	trackFrame.ZIndex = 3
+	trackFrame.ClipsDescendants = true
+	trackFrame.Parent = row
+	addCorner(trackFrame, 999)
+
+	local switchStroke = Instance.new("UIStroke")
+	switchStroke.Color = Color3.fromRGB(110, 115, 130)
+	switchStroke.Thickness = 1
+	switchStroke.Transparency = 0.25
+	switchStroke.Parent = trackFrame
+
+	local gradient = Instance.new("UIGradient")
+	gradient.Enabled = false
+	gradient.Parent = trackFrame
+
+	local thumb = Instance.new("Frame")
+	thumb.Size = UDim2.new(0, 18, 0, 18)
+	thumb.Position = UDim2.new(0, 5, 0.5, -9)
+	thumb.BorderSizePixel = 0
+	thumb.BackgroundColor3 = THEME.SUBTEXT
+	thumb.ZIndex = 5
+	thumb.Parent = trackFrame
+	addCorner(thumb, 999)
+
+	return {
+		button = row,
+		label = label,
+		track = trackFrame,
+		gradient = gradient,
+		thumb = thumb,
+	}
+end
+
+local function makeCheckButton(parent, labelText)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(0.5, -4, 0, 34)
+	button.BackgroundColor3 = THEME.BUTTON
+	button.Text = ""
+	button.AutoButtonColor = false
+	button.BorderSizePixel = 0
+	button.ZIndex = 2
+	button.Parent = parent
+	addCorner(button, 9)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, -36, 1, 0)
+	label.Position = UDim2.new(0, 8, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Text = labelText
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 12
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextColor3 = THEME.TEXT
+	label.ZIndex = 3
+	label.Parent = button
+
+	local box = Instance.new("Frame")
+	box.Size = UDim2.fromOffset(20, 20)
+	box.Position = UDim2.new(1, -27, 0.5, -10)
+	box.BackgroundColor3 = Color3.fromRGB(52, 56, 68)
+	box.BorderSizePixel = 0
+	box.ZIndex = 3
+	box.Parent = button
+	addCorner(box, 5)
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(110, 115, 130)
+	stroke.Thickness = 1
+	stroke.Parent = box
+
+	local mark = Instance.new("TextLabel")
+	mark.Size = UDim2.fromScale(1, 1)
+	mark.BackgroundTransparency = 1
+	mark.Text = ""
+	mark.Font = Enum.Font.GothamBold
+	mark.TextSize = 15
+	mark.TextColor3 = THEME.TEXT
+	mark.TextXAlignment = Enum.TextXAlignment.Center
+	mark.TextYAlignment = Enum.TextYAlignment.Center
+	mark.ZIndex = 4
+	mark.Parent = box
+
+	return {
+		button = button,
+		label = label,
+		checkBox = box,
+		checkMark = mark,
+		stroke = stroke,
+	}
+end
+
+setCheckWidget = function(widget, on)
+	if not widget then return end
+
+	widget.checkBox.BackgroundTransparency = on and 0 or 1
+	widget.checkBox.BackgroundColor3 = THEME.BUTTON_ACTIVE
+	widget.checkMark.Text = on and "✓" or ""
+
+	widget.stroke.Color = on
+		and THEME.BUTTON_ACTIVE
+		or THEME.SUBTEXT
+	widget.stroke.Transparency = on and 0 or 0.35
+end
+
+local function makeSpacer(px)
+	local spacer = Instance.new("Frame")
+	spacer.Size = UDim2.new(1, 0, 0, px or 6)
+	spacer.BackgroundTransparency = 1
+	spacer.LayoutOrder = nextOrder()
+	spacer.Parent = currentUIParent or frame
+	return spacer
+end
+
+local function makeNumberControl(options)
+	makeSpacer(6)
+
+	if not options.HideTitle then
+		makeLabel(options.Title, THEME.SUBTEXT, 20, 14)
+	end
+
+	local value = clampInt(options.Value, options.Min, options.Max)
+	local currentLabel = makeLabel((options.LabelPrefix or ("Current " .. options.Title .. ": ")) .. value, THEME.ACCENT)
+
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, 0, 0, 32)
+	box.BackgroundColor3 = Color3.fromRGB(62, 66, 78)
+	box.TextColor3 = THEME.TEXT
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 14
+	box.Text = tostring(value)
+	box.BorderSizePixel = 0
+	box.ZIndex = 2
+	box.ClearTextOnFocus = false
+	box.LayoutOrder = nextOrder()
+	box.Parent = currentUIParent or frame
+	addCorner(box, 8)
+
+	local slider = Instance.new("Frame")
+	slider.Size = UDim2.new(1, 0, 0, 10)
+	slider.BackgroundColor3 = Color3.fromRGB(62, 66, 78)
+	slider.BorderSizePixel = 0
+	slider.ZIndex = 2
+	slider.LayoutOrder = nextOrder()
+	slider.Parent = currentUIParent or frame
+	addCorner(slider, 999)
+
+	local fill = Instance.new("Frame")
+	fill.BackgroundColor3 = THEME.ACCENT
+	fill.BorderSizePixel = 0
+	fill.ZIndex = 3
+	fill.Parent = slider
+	addCorner(fill, 999)
+
+	local dragging = false
+
+	local function updateVisuals(newValue)
+		local alpha = 0
+		if options.Max ~= options.Min then
+			alpha = (newValue - options.Min) / (options.Max - options.Min)
+		end
+
+		box.Text = tostring(newValue)
+		fill.Size = UDim2.new(math.clamp(alpha, 0, 1), 0, 1, 0)
+		currentLabel.Text = (options.LabelPrefix or ("Current " .. options.Title .. ": ")) .. newValue
+	end
+
+	local function setValue(newValue, silent)
+		value = clampInt(newValue, options.Min, options.Max)
+		updateVisuals(value)
+		if options.OnChanged and not silent then
+			options.OnChanged(value)
+		end
+	end
+
+	local function setFromX(x)
+		local alpha = math.clamp((x - slider.AbsolutePosition.X) / slider.AbsoluteSize.X, 0, 1)
+		setValue(options.Min + alpha * (options.Max - options.Min))
+	end
+
+	track(slider.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end))
+
+	track(slider.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = false
+		end
+	end))
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			setFromX(input.Position.X)
+		end
+	end))
+
+	track(box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then
+			setValue(n)
+		else
+			updateVisuals(value)
+		end
+	end))
+
+	updateVisuals(value)
+	return setValue
+end
+
+local function makeSection(titleText, startsOpen, buildContent)
+	local outer = Instance.new("Frame")
+	outer.Size = UDim2.new(1, 0, 0, 44)
+	outer.BackgroundColor3 = THEME.PANEL
+	outer.BorderSizePixel = 0
+	outer.ZIndex = 2
+	outer.LayoutOrder = nextOrder()
+	outer.Parent = frame
+	outer.ClipsDescendants = true
+	addCorner(outer, 12)
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = THEME.OUTLINE
+	stroke.Thickness = 1
+	stroke.Transparency = 0.35
+	stroke.Parent = outer
+
+	local headerButton = Instance.new("TextButton")
+	headerButton.Name = "SectionHeader"
+	headerButton.Size = UDim2.new(1, 0, 0, 44)
+	headerButton.BackgroundTransparency = 1
+	headerButton.AutoButtonColor = false
+	headerButton.BorderSizePixel = 0
+	headerButton.Text = ""
+	headerButton.ZIndex = 4
+	headerButton.Parent = outer
+
+	local arrow = Instance.new("TextLabel")
+	arrow.Name = "Arrow"
+	arrow.Size = UDim2.new(0, 28, 1, 0)
+	arrow.Position = UDim2.new(0, 10, 0, 0)
+	arrow.BackgroundTransparency = 1
+	arrow.Font = Enum.Font.GothamBold
+	arrow.TextSize = 16
+	arrow.TextColor3 = THEME.ACCENT
+	arrow.ZIndex = 5
+	arrow.Parent = headerButton
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Size = UDim2.new(1, -54, 1, 0)
+	title.Position = UDim2.new(0, 42, 0, 0)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 14
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = THEME.TEXT
+	title.Text = titleText
+	title.ZIndex = 5
+	title.Parent = headerButton
+
+	local content = Instance.new("Frame")
+	content.Name = "Content"
+	content.Size = UDim2.new(1, -20, 0, 0)
+	content.Position = UDim2.new(0, 10, 0, 48)
+	content.BackgroundTransparency = 1
+	content.Visible = startsOpen
+	content.ZIndex = 3
+	content.Parent = outer
+
+	local contentLayout = Instance.new("UIListLayout")
+	contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	contentLayout.Padding = UDim.new(0, 8)
+	contentLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	contentLayout.Parent = content
+
+	local oldParent = currentUIParent
+	currentUIParent = content
+	buildContent(content)
+	currentUIParent = oldParent
+
+	local open = startsOpen
+	local function refreshSize()
+		content.Visible = open
+		arrow.Text = open and "▼" or "▶"
+
+		if open then
+			task.defer(function()
+				if outer and content and contentLayout then
+					outer.Size = UDim2.new(1, 0, 0, 56 + contentLayout.AbsoluteContentSize.Y)
+					content.Size = UDim2.new(1, -20, 0, contentLayout.AbsoluteContentSize.Y)
+				end
+			end)
+		else
+			outer.Size = UDim2.new(1, 0, 0, 44)
+			content.Size = UDim2.new(1, -20, 0, 0)
+		end
+	end
+
+	track(contentLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		if open then
+			refreshSize()
+		end
+	end))
+
+	track(headerButton.MouseButton1Click:Connect(function()
+		open = not open
+		refreshSize()
+	end))
+
+	refreshSize()
+	return outer, content
+end
+
+
+-- ===== AIMBOT / COMBAT =====
+
+local AimCore = (function()
+local AIM_ENTITY_SCAN_INTERVAL = 1.5
+local AIM_RESOLVE_INTERVAL = 1.5
+local AIM_CHARACTER_HISTORY_SECONDS = 5
+local AIM_SCAN_CHUNK = 50
+
+-- Expensive entity discovery is kept completely off the render hot path.
+local aimExternalEntityCache = {}
+local aimCharacterHistory = {}
+local aimResolvedCache = {}
+local aimLastEntityScan = -math.huge
+local aimEntityScanInProgress = false
+local aimExternalGeneration = 0
+
+local AIM_CONTROL_LINK_KEYS = {
+	controlledentity = true,
+	controlledmodel = true,
+	controlledcharacter = true,
+	controlledobject = true,
+	controlledunit = true,
+	currentcharacter = true,
+	activecharacter = true,
+	pawn = true,
+	activepawn = true,
+	currentpawn = true,
+	avatar = true,
+	activeavatar = true,
+	currentavatar = true,
+	possessed = true,
+	possessedmodel = true,
+	possessedentity = true,
+}
+
+local function aimNormalizeKey(value)
+	return tostring(value or ""):lower():gsub("[^%w]", "")
+end
+
+local function aimKeyLooksLikeOwnership(key)
+	key = aimNormalizeKey(key)
+
+	return key == "userid"
+		or key == "playerid"
+		or key == "playeruserid"
+		or key == "ownerid"
+		or key == "owneruserid"
+		or key == "username"
+		or key == "playername"
+		or key:find("owner", 1, true) ~= nil
+		or key:find("player", 1, true) ~= nil
+		or key:find("controlledby", 1, true) ~= nil
+		or key:find("controller", 1, true) ~= nil
+		or key:find("pilot", 1, true) ~= nil
+		or key:find("driver", 1, true) ~= nil
+		or key:find("occupant", 1, true) ~= nil
+end
+
+local function aimKeyImpliesActiveControl(key)
+	key = aimNormalizeKey(key)
+
+	return AIM_CONTROL_LINK_KEYS[key] == true
+		or key:find("controlledby", 1, true) ~= nil
+		or key:find("controller", 1, true) ~= nil
+		or key:find("pilot", 1, true) ~= nil
+		or key:find("driver", 1, true) ~= nil
+		or key:find("occupant", 1, true) ~= nil
+		or key:find("possess", 1, true) ~= nil
+end
+
+local function aimPartIsBodyCandidate(part)
+	if not part or not part:IsA("BasePart") then
+		return false
+	end
+
+	if part:FindFirstAncestorOfClass("Accessory") then
+		return false
+	end
+
+	if part:FindFirstAncestorOfClass("Tool") then
+		return false
+	end
+
+	return true
+end
+
+local function aimInstanceToEntity(instance)
+	if not instance or typeof(instance) ~= "Instance" then
+		return nil
+	end
+
+	if instance:IsA("Player") then
+		return instance.Character
+	end
+
+	if instance:IsA("Humanoid") or instance:IsA("AnimationController") then
+		instance = instance.Parent
+		if not instance then
+			return nil
+		end
+	end
+
+	if instance:IsA("Model") then
+		return instance
+	end
+
+	if instance:IsA("BasePart") then
+		return instance:FindFirstAncestorOfClass("Model") or instance
+	end
+
+	local model = instance:FindFirstAncestorOfClass("Model")
+	if model then
+		return model
+	end
+
+	return instance
+end
+
+local function aimMarkerContainer(marker)
+	if not marker then
+		return nil
+	end
+
+	local model = marker:FindFirstAncestorOfClass("Model")
+	if model then
+		return model
+	end
+
+	return aimInstanceToEntity(marker.Parent)
+end
+
+local function aimGetHumanoidDeep(entity)
+	if not entity then
+		return nil
+	end
+
+	if entity:IsA("Humanoid") then
+		return entity
+	end
+
+	return entity:FindFirstChildWhichIsA("Humanoid", true)
+end
+
+-- Slow/full alive check. This is intentionally NOT called every render frame.
+local function aimEntityAliveSlow(entity, knownHumanoid)
+	if not entity or not entity.Parent then
+		return false
+	end
+
+	local hum = knownHumanoid or aimGetHumanoidDeep(entity)
+	if hum then
+		return hum.Health > 0
+	end
+
+	for _, attrName in ipairs({ "Alive", "IsAlive" }) do
+		if entity:GetAttribute(attrName) == false then
+			return false
+		end
+	end
+
+	for _, attrName in ipairs({ "Dead", "IsDead" }) do
+		if entity:GetAttribute(attrName) == true then
+			return false
+		end
+	end
+
+	for _, attrName in ipairs({ "Health", "HP", "HitPoints" }) do
+		local value = entity:GetAttribute(attrName)
+		if typeof(value) == "number" and value <= 0 then
+			return false
+		end
+	end
+
+	-- Only inspect custom ValueObject health systems during the slow refresh.
+	for _, child in ipairs(entity:GetDescendants()) do
+		local key = aimNormalizeKey(child.Name)
+
+		if child:IsA("BoolValue") then
+			if (key == "dead" or key == "isdead") and child.Value == true then
+				return false
+			end
+			if (key == "alive" or key == "isalive") and child.Value == false then
+				return false
+			end
+		elseif child:IsA("NumberValue") or child:IsA("IntValue") then
+			if (key == "health" or key == "hp" or key == "hitpoints") and child.Value <= 0 then
+				return false
+			end
+		end
+	end
+
+	return true
+end
+
+local function aimFastAlive(entity, humanoid, part)
+	if not entity or not entity.Parent or not part or not part.Parent then
+		return false
+	end
+
+	if humanoid and humanoid.Parent then
+		return humanoid.Health > 0
+	end
+
+	-- Custom non-Humanoid entities are revalidated by the slow resolver.
+	return true
+end
+
+local function aimGetTeamKey(otherPlayer)
+	-- Player.Neutral is authoritative. Roblox can leave Team populated while
+	-- Neutral is true, so checking Team alone can misclassify a neutral player
+	-- under a real team button.
+	if otherPlayer.Neutral == true or otherPlayer.Team == nil then
+		return "__NEUTRAL__"
+	end
+
+	return otherPlayer.Team
+end
+
+local function aimTeamDisplayName(key)
+	if key == "__NEUTRAL__" then
+		return "Neutral / No Team"
+	end
+
+	if typeof(key) == "Instance" and key:IsA("Team") then
+		return key.Name
+	end
+
+	return tostring(key)
+end
+
+local function aimDefaultAllowsTeamKey(key)
+	if key == "__NEUTRAL__" then
+		return true
+	end
+
+	if typeof(key) == "Instance" and key:IsA("Team") then
+		-- If the local player is neutral, there is no meaningful own-team
+		-- exclusion even if Roblox still has a Team object assigned.
+		if player.Neutral == true or player.Team == nil then
+			return true
+		end
+
+		return key ~= player.Team
+	end
+
+	return true
+end
+
+local function aimTeamStorageKey(key)
+	if key == "__NEUTRAL__" then return "__NEUTRAL__" end
+	if typeof(key) == "Instance" and key:IsA("Team") then
+		return "TEAM:" .. key.Name
+	end
+	return "OTHER:" .. tostring(key)
+end
+
+local function aimTeamAllowedByKey(key)
+	local override = aimTeamOverrides[aimTeamStorageKey(key)]
+	if override ~= nil then
+		return override
+	end
+	return aimDefaultAllowsTeamKey(key)
+end
+
+local function aimTargetAllowed(otherPlayer)
+	if not otherPlayer or otherPlayer == player or not otherPlayer.Parent then
+		return false
+	end
+
+	return aimTeamAllowedByKey(aimGetTeamKey(otherPlayer))
+end
+
+local function aimIsSeated(char)
+	local hum = aimGetHumanoidDeep(char)
+	if not hum then
+		return false
+	end
+
+	return hum.SeatPart ~= nil or hum.Sit == true
+end
+
+local function aimGetSeat(char)
+	local hum = aimGetHumanoidDeep(char)
+	return hum and hum.SeatPart or nil
+end
+
+-- Slow part discovery. The returned BasePart is cached and its Position is then
+-- read directly every frame, so arbitrary-rig support does not cost a tree scan.
+local function aimGetPartSlow(entity)
+	if not entity then
+		return nil
+	end
+
+	if aimPartIsBodyCandidate(entity) then
+		return entity
+	end
+
+	local head = entity:FindFirstChild("Head", true)
+	if head and aimPartIsBodyCandidate(head) then
+		return head
+	end
+
+	local preferredNames = {
+		"UpperTorso",
+		"Torso",
+		"LowerTorso",
+		"HumanoidRootPart",
+		"RootPart",
+		"Root",
+		"Chest",
+		"UpperBody",
+		"Body",
+		"Core",
+		"Center",
+		"Centre",
+		"Main",
+		"MainPart",
+		"BodyRoot",
+		"CharacterRoot",
+		"AvatarRoot",
+		"Pivot",
+	}
+
+	for _, partName in ipairs(preferredNames) do
+		local part = entity:FindFirstChild(partName, true)
+		if aimPartIsBodyCandidate(part) then
+			return part
+		end
+	end
+
+	local hum = aimGetHumanoidDeep(entity)
+	if hum and hum.RootPart and aimPartIsBodyCandidate(hum.RootPart) then
+		return hum.RootPart
+	end
+
+	if entity:IsA("Model") and entity.PrimaryPart and aimPartIsBodyCandidate(entity.PrimaryPart) then
+		return entity.PrimaryPart
+	end
+
+	local pivotPosition = nil
+	local ok, pivot = pcall(function()
+		return entity:GetPivot()
+	end)
+
+	if ok and pivot then
+		pivotPosition = pivot.Position
+	end
+
+	local bestPart = nil
+	local bestDistance = math.huge
+
+	for _, descendant in ipairs(entity:GetDescendants()) do
+		if aimPartIsBodyCandidate(descendant) then
+			if not pivotPosition then
+				return descendant
+			end
+
+			local distanceFromCenter = (descendant.Position - pivotPosition).Magnitude
+			if distanceFromCenter < bestDistance then
+				bestDistance = distanceFromCenter
+				bestPart = descendant
+			end
+		end
+	end
+
+	if bestPart then
+		return bestPart
+	end
+
+	local seat = aimGetSeat(entity)
+	if seat and seat:IsA("BasePart") then
+		return seat
+	end
+
+	return nil
+end
+
+local function aimCharacterLooksLikeProxySlow(char)
+	if not char or not char.Parent then
+		return true
+	end
+
+	for _, attrName in ipairs({
+		"Proxy",
+		"IsProxy",
+		"Dummy",
+		"IsDummy",
+		"Spectator",
+		"IsSpectator",
+		"HiddenCharacter",
+	}) do
+		if char:GetAttribute(attrName) == true then
+			return true
+		end
+	end
+
+	local bodyParts = 0
+	local visibleBodyParts = 0
+
+	for _, descendant in ipairs(char:GetDescendants()) do
+		if aimPartIsBodyCandidate(descendant) then
+			bodyParts += 1
+			if descendant.Transparency < 0.95 then
+				visibleBodyParts += 1
+			end
+		end
+	end
+
+	return bodyParts == 0 or visibleBodyParts == 0
+end
+
+local function aimRememberCharacter(otherPlayer, char)
+	if not otherPlayer or not char then
+		return
+	end
+
+	local history = aimCharacterHistory[otherPlayer]
+	if not history then
+		history = {}
+		aimCharacterHistory[otherPlayer] = history
+	end
+
+	if history[1] and history[1].character == char then
+		history[1].seenAt = os.clock()
+		return
+	end
+
+	for index = #history, 1, -1 do
+		if history[index].character == char then
+			table.remove(history, index)
+		end
+	end
+
+	table.insert(history, 1, {
+		character = char,
+		seenAt = os.clock(),
+	})
+
+	while #history > 3 do
+		table.remove(history)
+	end
+end
+
+local function aimGetRecentCharacter(otherPlayer)
+	local history = aimCharacterHistory[otherPlayer]
+	if not history then
+		return nil
+	end
+
+	local now = os.clock()
+
+	for index = #history, 1, -1 do
+		local entry = history[index]
+		local char = entry.character
+
+		if not char or not char.Parent or now - entry.seenAt > AIM_CHARACTER_HISTORY_SECONDS then
+			table.remove(history, index)
+		else
+			local part = aimGetPartSlow(char)
+			local hum = aimGetHumanoidDeep(char)
+			if part and aimEntityAliveSlow(char, hum) then
+				return char, part, hum
+			end
+		end
+	end
+
+	return nil
+end
+
+local function aimEntityLooksControllable(entity)
+	if not entity then
+		return false
+	end
+
+	return aimGetHumanoidDeep(entity) ~= nil
+		or entity:FindFirstChildWhichIsA("AnimationController", true) ~= nil
+		or entity:FindFirstChildWhichIsA("ControllerManager", true) ~= nil
+		or entity:FindFirstChildWhichIsA("VehicleSeat", true) ~= nil
+		or entity:FindFirstChildWhichIsA("Seat", true) ~= nil
+end
+
+local function aimAddExternalCandidate(cache, otherPlayer, entity, score, force, reason)
+	entity = aimInstanceToEntity(entity)
+
+	if not otherPlayer
+		or not entity
+		or not entity.Parent
+		or entity == workspace
+	then
+		return
+	end
+
+	local char = otherPlayer.Character
+	if char and (entity == char or entity:IsDescendantOf(char)) then
+		return
+	end
+
+	local bucket = cache[otherPlayer]
+	if not bucket then
+		bucket = {}
+		cache[otherPlayer] = bucket
+	end
+
+	local current = bucket[entity]
+	if not current or score > current.score then
+		bucket[entity] = {
+			entity = entity,
+			score = score,
+			force = force == true,
+			reason = reason,
+		}
+	elseif force then
+		current.force = true
+	end
+end
+
+local function aimPlayerFromReferencedInstance(instance)
+	if not instance or typeof(instance) ~= "Instance" then
+		return nil
+	end
+
+	if instance:IsA("Player") then
+		return instance
+	end
+
+	local current = instance
+	if current:IsA("Humanoid") or current:IsA("AnimationController") then
+		current = current.Parent
+	end
+
+	if not current then
+		return nil
+	end
+
+	local model = current:IsA("Model") and current or current:FindFirstAncestorOfClass("Model")
+
+	while model do
+		local owner = Players:GetPlayerFromCharacter(model)
+		if owner then
+			return owner
+		end
+		model = model:FindFirstAncestorOfClass("Model")
+	end
+
+	return nil
+end
+
+-- Guard shared vehicle/external-model candidates against stale seat ownership.
+-- This is intentionally evaluated only on the slow resolver path, not every
+-- render frame. It prevents an old cached vehicle from staying associated with
+-- Player A after Player B becomes the actual seated occupant.
+local function aimExternalEntityMatchesPlayer(otherPlayer, entity, reason)
+	if not otherPlayer or not entity or not entity.Parent then
+		return false
+	end
+
+	local char = otherPlayer.Character
+	if char and (entity == char or entity:IsDescendantOf(char)) then
+		return true
+	end
+
+	-- Seat-derived candidates must still be the container of this exact player's
+	-- CURRENT SeatPart. This is much cheaper and more precise than scanning every
+	-- seat in a shared vehicle model.
+	if reason == "seat-occupant" then
+		local hum = char and aimGetHumanoidDeep(char) or nil
+		local seat = hum and hum.SeatPart or nil
+		if not seat then
+			return false
+		end
+
+		return aimMarkerContainer(seat) == entity
+	end
+
+	-- Connected-assembly candidates must still be physically connected to this
+	-- player's root. This keeps an old vehicle from being reused after they exit.
+	-- It runs only on the slow resolver path, never every render frame.
+	if reason == "connected-assembly" and char then
+		local hum = aimGetHumanoidDeep(char)
+		local rootPart = hum and hum.RootPart or char.PrimaryPart
+		if not rootPart or not rootPart:IsA("BasePart") then
+			return false
+		end
+
+		local ok, connectedParts = pcall(function()
+			return rootPart:GetConnectedParts(true)
+		end)
+
+		if not ok then
+			return false
+		end
+
+		for _, connectedPart in ipairs(connectedParts) do
+			if connectedPart == entity or connectedPart:IsDescendantOf(entity) then
+				return true
+			end
+		end
+
+		return false
+	end
+
+	-- Explicit control references/name links are trusted because they originate
+	-- from that specific Player/Character and are refreshed by the scan.
+	return true
+end
+
+-- Starts a CHUNKED workspace scan. It never walks Workspace synchronously from
+-- RenderStepped, which prevents the large frame stalls from the previous build.
+local function aimStartExternalScan(forceRefresh)
+	-- Performance-safe universal discovery.
+	--
+	-- IMPORTANT: this deliberately does NOT crawl workspace:GetDescendants().
+	-- Global scans created large queues/garbage and caused lingering frame drops.
+	--
+	-- Instead we only follow relationships that originate from each Player or
+	-- their Character, plus physical seat/assembly relationships. A proxy
+	-- character gets one name-based recursive lookup as a last-resort heuristic.
+	local now = os.clock()
+
+	if not forceRefresh and now - aimLastEntityScan < AIM_ENTITY_SCAN_INTERVAL then
+		return
+	end
+
+	aimLastEntityScan = now
+
+	local cache = {}
+
+	local function addReferencedEntity(otherPlayer, char, value, reason, score, force)
+		if typeof(value) ~= "Instance" then
+			return
+		end
+
+		local entity = aimInstanceToEntity(value)
+		if entity
+			and entity.Parent
+			and entity:IsDescendantOf(workspace)
+			and (not char or (entity ~= char and not entity:IsDescendantOf(char)))
+		then
+			aimAddExternalCandidate(
+				cache,
+				otherPlayer,
+				entity,
+				score,
+				force,
+				reason
+			)
+		end
+	end
+
+	local function tryNamedWorkspaceEntity(otherPlayer, char, name)
+		name = tostring(name or "")
+		if name == "" then
+			return
+		end
+
+		-- FindFirstChild(..., true) avoids allocating a full Workspace descendant
+		-- array. This path is only used for proxy/invisible Character setups.
+		local found = workspace:FindFirstChild(name, true)
+		if not found then
+			return
+		end
+
+		local entity = aimInstanceToEntity(found)
+		if entity
+			and entity.Parent
+			and entity ~= char
+			and (not char or not entity:IsDescendantOf(char))
+			and aimEntityLooksControllable(entity)
+		then
+			aimAddExternalCandidate(
+				cache,
+				otherPlayer,
+				entity,
+				45,
+				false,
+				"proxy-name-match"
+			)
+		end
+	end
+
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		cache[otherPlayer] = {}
+
+		local char = otherPlayer.Character
+		if char then
+			aimRememberCharacter(otherPlayer, char)
+		end
+
+		-- Explicit links attached to Player/Character are the strongest and most
+		-- portable custom-controller convention.
+		local roots = { otherPlayer }
+		if char then
+			table.insert(roots, char)
+		end
+
+		for _, root in ipairs(roots) do
+			for _, descendant in ipairs(root:GetDescendants()) do
+				local key = aimNormalizeKey(descendant.Name)
+
+				if descendant:IsA("ObjectValue") and descendant.Value then
+					if AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key) then
+						addReferencedEntity(
+							otherPlayer,
+							char,
+							descendant.Value,
+							"direct-control-reference",
+							125,
+							true
+						)
+					end
+
+				elseif descendant:IsA("StringValue")
+					and (AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key))
+				then
+					local modelName = descendant.Value
+					if modelName ~= "" then
+						local found = workspace:FindFirstChild(modelName, true)
+						if found then
+							addReferencedEntity(
+								otherPlayer,
+								char,
+								found,
+								"direct-control-name",
+								115,
+								true
+							)
+						end
+					end
+				end
+			end
+
+			for attrName, attrValue in pairs(root:GetAttributes()) do
+				local key = aimNormalizeKey(attrName)
+				if typeof(attrValue) == "string"
+					and (AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key))
+					and attrValue ~= ""
+				then
+					local found = workspace:FindFirstChild(attrValue, true)
+					if found then
+						addReferencedEntity(
+							otherPlayer,
+							char,
+							found,
+							"direct-control-attribute",
+							115,
+							true
+						)
+					end
+				end
+			end
+		end
+
+		if char then
+			local hum = aimGetHumanoidDeep(char)
+
+			-- Seat relationship: supports standard vehicles and custom vehicle
+			-- models without searching the rest of Workspace.
+			if hum and hum.SeatPart then
+				local seatEntity = aimMarkerContainer(hum.SeatPart)
+				if seatEntity and seatEntity ~= char then
+					aimAddExternalCandidate(
+						cache,
+						otherPlayer,
+						seatEntity,
+						95,
+						false,
+						"seat-occupant"
+					)
+				end
+			end
+
+			-- Physically attached external morphs/mechs/shells.
+			local rootPart = hum and hum.RootPart or char.PrimaryPart
+			if rootPart and rootPart:IsA("BasePart") then
+				local ok, connectedParts = pcall(function()
+					return rootPart:GetConnectedParts(true)
+				end)
+
+				if ok then
+					for _, connectedPart in ipairs(connectedParts) do
+						if connectedPart.Parent
+							and not connectedPart:IsDescendantOf(char)
+						then
+							aimAddExternalCandidate(
+								cache,
+								otherPlayer,
+								connectedPart,
+								70,
+								false,
+								"connected-assembly"
+							)
+						end
+					end
+				end
+			end
+
+			-- Only proxy/invisible Character setups get the weak name heuristic.
+			-- Normal R6/R15/custom visible characters never touch this path.
+			if aimCharacterLooksLikeProxySlow(char) then
+				tryNamedWorkspaceEntity(otherPlayer, char, otherPlayer.Name)
+
+				if otherPlayer.DisplayName ~= otherPlayer.Name then
+					tryNamedWorkspaceEntity(otherPlayer, char, otherPlayer.DisplayName)
+				end
+			end
+		end
+	end
+
+	aimExternalEntityCache = cache
+	aimExternalGeneration += 1
+end
+
+local function aimBestExternalEntity(otherPlayer, minimumScore, forceOnly)
+	local bucket = aimExternalEntityCache[otherPlayer]
+	if not bucket then
+		return nil, nil, nil, nil
+	end
+
+	local bestEntity = nil
+	local bestPart = nil
+	local bestHumanoid = nil
+	local bestReason = nil
+	local bestScore = -math.huge
+
+	for entity, candidate in pairs(bucket) do
+		if not entity.Parent then
+			bucket[entity] = nil
+			continue
+		end
+
+		if candidate.score < (minimumScore or 0) then
+			continue
+		end
+
+		if forceOnly and not candidate.force then
+			continue
+		end
+
+		if candidate.score <= bestScore then
+			continue
+		end
+
+		if not aimExternalEntityMatchesPlayer(otherPlayer, entity, candidate.reason) then
+			continue
+		end
+
+		local part = aimGetPartSlow(entity)
+		if not part then
+			continue
+		end
+
+		local hum = aimGetHumanoidDeep(entity)
+		if not aimEntityAliveSlow(entity, hum) then
+			continue
+		end
+
+		bestScore = candidate.score
+		bestEntity = entity
+		bestPart = part
+		bestHumanoid = hum
+		bestReason = candidate.reason
+	end
+
+	return bestEntity, bestPart, bestHumanoid, bestReason
+end
+
+local function aimStoreResolved(otherPlayer, char, entity, part, hum, reason, proxy)
+	local sourceHumanoid = char and aimGetHumanoidDeep(char) or nil
+
+	local entry = {
+		character = char,
+		entity = entity,
+		part = part,
+		humanoid = hum,
+		reason = reason,
+		proxy = proxy == true,
+		resolvedAt = os.clock(),
+		generation = aimExternalGeneration,
+
+		-- Snapshot the player's own seating relationship. This lets the fast cache
+		-- invalidate a stale vehicle immediately without rescanning the whole model.
+		sourceHumanoid = sourceHumanoid,
+		sourceSeat = sourceHumanoid and sourceHumanoid.SeatPart or nil,
+	}
+
+	aimResolvedCache[otherPlayer] = entry
+	return entry
+end
+
+local function aimCachedRelationshipStillValid(cached)
+	if not cached then
+		return false
+	end
+
+	if cached.reason == "seat-occupant" then
+		local sourceHumanoid = cached.sourceHumanoid
+		local currentSeat = sourceHumanoid and sourceHumanoid.Parent and sourceHumanoid.SeatPart or nil
+
+		if not currentSeat or currentSeat ~= cached.sourceSeat then
+			return false
+		end
+
+		local currentSeatEntity = aimMarkerContainer(currentSeat)
+		return currentSeatEntity == cached.entity
+	end
+
+	-- If a connected assembly was discovered while seated, invalidate it as soon
+	-- as that player's SeatPart changes. This is a cheap property check.
+	if cached.reason == "connected-assembly" and cached.sourceSeat ~= nil then
+		local sourceHumanoid = cached.sourceHumanoid
+		return sourceHumanoid ~= nil
+			and sourceHumanoid.Parent ~= nil
+			and sourceHumanoid.SeatPart == cached.sourceSeat
+	end
+
+	return true
+end
+
+local function aimResolveTarget(otherPlayer)
+	if not otherPlayer then
+		return nil
+	end
+
+	local now = os.clock()
+	local char = otherPlayer.Character
+	local cached = aimResolvedCache[otherPlayer]
+
+	-- Fast path: cached physical part + cached Humanoid. No GetDescendants,
+	-- FindFirstChild(..., true), ownership scan, or controller search here.
+	if cached
+		and cached.character == char
+		and now - cached.resolvedAt < AIM_RESOLVE_INTERVAL
+		and aimFastAlive(cached.entity, cached.humanoid, cached.part)
+		and aimCachedRelationshipStillValid(cached)
+	then
+		return cached
+	end
+
+	if char then
+		aimRememberCharacter(otherPlayer, char)
+	end
+
+	-- The global universal discovery scan is asynchronous/chunked.
+	aimStartExternalScan(false)
+
+	-- Standard seated characters keep the proven vehicle behavior.
+	if char then
+		local charPart = aimGetPartSlow(char)
+		local charHum = aimGetHumanoidDeep(char)
+
+		if charPart and aimEntityAliveSlow(char, charHum) then
+			if charHum and (charHum.SeatPart ~= nil or charHum.Sit == true) then
+				return aimStoreResolved(
+					otherPlayer,
+					char,
+					char,
+					charPart,
+					charHum,
+					"character-seated",
+					false
+				)
+			end
+
+			-- A cached explicit control link may intentionally override Character.
+			local forcedEntity, forcedPart, forcedHum, forcedReason =
+				aimBestExternalEntity(otherPlayer, 100, true)
+
+			if forcedEntity then
+				return aimStoreResolved(
+					otherPlayer,
+					char,
+					forcedEntity,
+					forcedPart,
+					forcedHum,
+					forcedReason,
+					false
+				)
+			end
+
+			local proxy = aimCharacterLooksLikeProxySlow(char)
+
+			if proxy then
+				local proxyEntity, proxyPart, proxyHum, proxyReason =
+					aimBestExternalEntity(otherPlayer, 55, false)
+
+				if proxyEntity then
+					return aimStoreResolved(
+						otherPlayer,
+						char,
+						proxyEntity,
+						proxyPart,
+						proxyHum,
+						proxyReason,
+						true
+					)
+				end
+			end
+
+			return aimStoreResolved(
+				otherPlayer,
+				char,
+				char,
+				charPart,
+				charHum,
+				"character",
+				proxy
+			)
+		end
+	end
+
+	local externalEntity, externalPart, externalHum, externalReason =
+		aimBestExternalEntity(otherPlayer, 35, false)
+
+	if externalEntity then
+		return aimStoreResolved(
+			otherPlayer,
+			char,
+			externalEntity,
+			externalPart,
+			externalHum,
+			externalReason,
+			true
+		)
+	end
+
+	local recentChar, recentPart, recentHum = aimGetRecentCharacter(otherPlayer)
+	if recentChar then
+		return aimStoreResolved(
+			otherPlayer,
+			char,
+			recentChar,
+			recentPart,
+			recentHum,
+			"recent-character",
+			true
+		)
+	end
+
+	aimResolvedCache[otherPlayer] = {
+		character = char,
+		entity = nil,
+		part = nil,
+		humanoid = nil,
+		reason = nil,
+		proxy = true,
+		resolvedAt = now,
+		generation = aimExternalGeneration,
+	}
+
+	return aimResolvedCache[otherPlayer]
+end
+
+local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
+	local char = otherPlayer and otherPlayer.Character or nil
+	local cam = workspace.CurrentCamera
+	if not cam then return false end
+
+	local origin = cam.CFrame.Position
+	local direction = targetPosition - origin
+	if direction.Magnitude <= 0 then return true end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	params.RespectCanCollide = false
+
+	local exclude = {}
+	local seen = {}
+	local function addExclude(instance)
+		if instance and not seen[instance] then
+			seen[instance] = true
+			table.insert(exclude, instance)
+		end
+	end
+
+	addExclude(targetEntity)
+	addExclude(char)
+	addExclude(getCharacter())
+
+	-- When a target is seated, ignore the vehicle they are physically attached to,
+	-- but DO NOT bypass the raycast. Real walls/terrain must still block aim.
+	if char then
+		local hum = aimGetHumanoidDeep(char)
+		local seat = hum and hum.SeatPart or nil
+		if seat then
+			local vehicleModel = seat:FindFirstAncestorOfClass("Model")
+			addExclude(vehicleModel or seat)
+
+			local ok, connected = pcall(function() return seat:GetConnectedParts(true) end)
+			if ok then
+				for _, part in ipairs(connected) do addExclude(part) end
+			end
+		end
+	end
+
+	params.FilterDescendantsInstances = exclude
+	return workspace:Raycast(origin, direction, params) == nil
+end
+
+local function aimValidTarget(otherPlayer)
+	if not aimTargetAllowed(otherPlayer) then
+		return false
+	end
+
+	local resolved = aimResolveTarget(otherPlayer)
+	if not resolved
+		or not aimFastAlive(resolved.entity, resolved.humanoid, resolved.part)
+	then
+		return false
+	end
+
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return false
+	end
+
+	local targetPosition = resolved.part.Position
+	local difference = targetPosition - cam.CFrame.Position
+	local distance = difference.Magnitude
+
+	if distance <= 0 or distance > aimMaxDistance then
+		return false
+	end
+
+	local screenPosition, visible = cam:WorldToViewportPoint(targetPosition)
+	if not visible or screenPosition.Z <= 0 then
+		return false
+	end
+
+	return aimHasLineOfSight(resolved.entity, targetPosition, otherPlayer)
+end
+
+local function aimFindBestTarget()
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return nil, nil, nil
+	end
+
+	-- This is only a cheap interval/in-progress check. Actual Workspace discovery
+	-- happens in a chunked task and never blocks this render frame.
+	aimStartExternalScan(false)
+
+	local cameraPosition = cam.CFrame.Position
+	local minimumDot = math.cos(math.rad(CONFIG.AIMLOCK.FOVDegrees))
+	local candidates = {}
+
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		if not aimTargetAllowed(otherPlayer) then
+			continue
+		end
+
+		local resolved = aimResolveTarget(otherPlayer)
+		if not resolved
+			or not aimFastAlive(resolved.entity, resolved.humanoid, resolved.part)
+		then
+			continue
+		end
+
+		-- Hard policy gate after resolution too. This makes team/Neutral changes
+		-- authoritative even if they happen while a cached vehicle/proxy is live.
+		if not aimTargetAllowed(otherPlayer) then
+			continue
+		end
+
+		local targetPosition = resolved.part.Position
+		local difference = targetPosition - cameraPosition
+		local distance = difference.Magnitude
+
+		if distance <= 0 or distance > aimMaxDistance then
+			continue
+		end
+
+		local direction = difference.Unit
+		if cam.CFrame.LookVector:Dot(direction) < minimumDot then
+			continue
+		end
+
+		local screenPosition, visible = cam:WorldToViewportPoint(targetPosition)
+		if not visible or screenPosition.Z <= 0 then
+			continue
+		end
+
+		table.insert(candidates, {
+			player = otherPlayer,
+			entity = resolved.entity,
+			position = targetPosition,
+			distance = distance,
+		})
+	end
+
+	-- Sort by true world distance first, then raycast from nearest outward.
+	-- In the common case this means ONE raycast per frame instead of one per player.
+	table.sort(candidates, function(a, b)
+		return a.distance < b.distance
+	end)
+
+	for _, candidate in ipairs(candidates) do
+		-- Final live re-check prevents a player who changed team/Neutral state during
+		-- this frame from slipping through a previously built candidate entry.
+		if aimTargetAllowed(candidate.player)
+			and aimHasLineOfSight(candidate.entity, candidate.position, candidate.player)
+		then
+			return candidate.player, candidate.entity, candidate.position
+		end
+	end
+
+	return nil, nil, nil
+end
+
+local function aimGetPosition(entity)
+	local part = aimGetPartSlow(entity)
+	return part and part.Position or nil
+end
+
+	local function aimReset()
+		table.clear(aimExternalEntityCache)
+		table.clear(aimResolvedCache)
+		table.clear(aimCharacterHistory)
+		aimLastEntityScan = -math.huge
+		aimEntityScanInProgress = false
+		aimExternalGeneration += 1
+	end
+
+	return {
+		validTarget = aimValidTarget,
+		findBestTarget = aimFindBestTarget,
+		getPosition = aimGetPosition,
+		targetAllowed = aimTargetAllowed,
+		isSeated = aimIsSeated,
+		teamDisplayName = aimTeamDisplayName,
+		teamAllowedByKey = aimTeamAllowedByKey,
+		teamStorageKey = aimTeamStorageKey,
+		reset = aimReset,
+	}
+end)()
+
+local function updateAimlockUI()
+	setToggleWidget(aimLockBtn, aimLockEnabled, "Aimbot")
+
+	if aimTargetLabel then
+		if not aimLockEnabled or not aimCurrentTarget then
+			aimTargetLabel.Text = "Target: None"
+			aimTargetLabel.TextColor3 = THEME.SUBTEXT
+		end
+	end
+end
+
+local function setAimLockEnabled(on)
+	aimLockEnabled = on
+
+	if not aimLockEnabled then
+		aimCurrentTarget = nil
+		AimCore.reset()
+	end
+
+	updateAimlockUI()
+end
+
+local function aimCollectTeamKeys()
+	local keys = {}
+	local seen = {}
+
+	for _, team in ipairs(Teams:GetTeams()) do
+		if not seen[team] then
+			seen[team] = true
+			table.insert(keys, team)
+		end
+	end
+
+	-- Always expose neutral/no-team targeting as a deliberate choice.
+	table.insert(keys, "__NEUTRAL__")
+
+	table.sort(keys, function(a, b)
+		return AimCore.teamDisplayName(a):lower() < AimCore.teamDisplayName(b):lower()
+	end)
+
+	return keys
+end
+
+local function aimStyleTeamButton(button, key)
+	local target = AimCore.teamAllowedByKey(key)
+
+	button.Text = AimCore.teamDisplayName(key)
+		.. (target and "   [TARGET]" or "   [IGNORE]")
+
+	button.BackgroundColor3 = target
+		and Color3.fromRGB(42, 118, 74)
+		or Color3.fromRGB(104, 52, 58)
+end
+
+local function rebuildAimTeamButtons()
+	if not aimTeamScroll or not aimTeamScroll.Parent then
+		return
+	end
+
+	disconnectBucket(ENH.DynamicAimTeamConnections)
+
+	for _, button in pairs(aimTeamButtons) do
+		if button and button.Parent then
+			button:Destroy()
+		end
+	end
+
+	table.clear(aimTeamButtons)
+
+	for index, key in ipairs(aimCollectTeamKeys()) do
+		local button = Instance.new("TextButton")
+		button.Name = "AimTeam_" .. tostring(index)
+		button.Size = UDim2.new(1, -12, 0, 30)
+		button.BackgroundColor3 = THEME.BUTTON
+		button.BorderSizePixel = 0
+		button.AutoButtonColor = false
+		button.Font = Enum.Font.GothamMedium
+		button.TextSize = 12
+		button.TextColor3 = THEME.TEXT
+		button.TextXAlignment = Enum.TextXAlignment.Left
+		button.LayoutOrder = index
+		button.ZIndex = 4
+		button.Parent = aimTeamScroll
+		addCorner(button, 8)
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 10)
+		padding.PaddingRight = UDim.new(0, 10)
+		padding.Parent = button
+
+		aimTeamButtons[key] = button
+		aimStyleTeamButton(button, key)
+
+		track(button.MouseButton1Click:Connect(function()
+			local current = AimCore.teamAllowedByKey(key)
+
+			-- One click flips this team between TARGET and IGNORE.
+			aimTeamOverrides[AimCore.teamStorageKey(key)] = not current
+			ENH.GamePrefs.AimTeamOverrides = aimTeamOverrides
+			scheduleSaveSettings()
+			aimStyleTeamButton(button, key)
+
+			-- Drop any cached vehicle/proxy association immediately when target policy
+			-- changes so the new IGNORE/TARGET choice is authoritative this frame.
+			AimCore.reset()
+
+			if aimCurrentTarget and not AimCore.targetAllowed(aimCurrentTarget) then
+				aimCurrentTarget = nil
+				updateAimlockUI()
+			end
+		end), ENH.DynamicAimTeamConnections)
+	end
+end
+
+
+-- ===== UI ACTIONS =====
+local function giveTeleportTool()
+	local backpack = player:WaitForChild("Backpack")
+
+	local old = backpack:FindFirstChild("Teleport Tool")
+	if old then old:Destroy() end
+
+	local tool = Instance.new("Tool")
+	tool.Name = "Teleport Tool"
+	tool.RequiresHandle = false
+	tool.CanBeDropped = false
+	tool.Parent = backpack
+
+	local mouse = player:GetMouse()
+	track(tool.Activated:Connect(function()
+		local char = getCharacter()
+		local root = getHRP(char)
+		if not char or not root then return end
+
+		local pos = mouse.Hit.Position + Vector3.new(0, 3, 0)
+		local rot = root.CFrame - root.CFrame.Position
+		root.CFrame = CFrame.new(pos) * rot
+	end))
+end
+
+local function giveBTools()
+	local backpack = player:WaitForChild("Backpack")
+
+	local function removeOldTool(name)
+		local oldBackpackTool = backpack:FindFirstChild(name)
+		if oldBackpackTool then
+			oldBackpackTool:Destroy()
+		end
+
+		local char = getCharacter()
+		local oldEquippedTool = char and char:FindFirstChild(name)
+		if oldEquippedTool then
+			oldEquippedTool:Destroy()
+		end
+	end
+
+	local function isValidTarget(target)
+		return target
+			and target:IsA("BasePart")
+			and not target:IsDescendantOf(getCharacter())
+	end
+
+	local function makeTool(name, highlightColor, mode)
+		removeOldTool(name)
+
+		local tool = Instance.new("Tool")
+		tool.Name = name
+		tool.RequiresHandle = false
+		tool.CanBeDropped = false
+		tool.Parent = backpack
+
+		local hoverHighlight = Instance.new("Highlight")
+		hoverHighlight.Name = name .. "_TargetHighlight"
+		hoverHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hoverHighlight.FillColor = highlightColor
+		hoverHighlight.OutlineColor = highlightColor
+		hoverHighlight.FillTransparency = 1
+		hoverHighlight.OutlineTransparency = 0
+		hoverHighlight.Enabled = false
+		hoverHighlight.Parent = espFolder
+
+		local equipped = false
+		local dragging = false
+		local draggedPart = nil
+		local dragOffset = Vector3.zero
+		local savedRotation = CFrame.identity
+		local originalAnchored = false
+		local oldTargetFilter = nil
+
+		local hoverConn = nil
+		local downConn = nil
+		local upConn = nil
+		local keyConn = nil
+
+		local function stopDragging(mouse)
+			if draggedPart and draggedPart.Parent then
+				draggedPart.Anchored = originalAnchored
+			end
+
+			if mouse then
+				mouse.TargetFilter = oldTargetFilter
+			end
+
+			dragging = false
+			draggedPart = nil
+			hoverHighlight.Adornee = nil
+			hoverHighlight.Enabled = false
+		end
+
+		local function beginDragging(mouse, target)
+			if not isValidTarget(target) then return end
+
+			local selected = target
+
+			if mode == "CLONE" then
+				selected = target:Clone()
+				selected.Parent = target.Parent
+			end
+
+			draggedPart = selected
+			dragging = true
+			originalAnchored = selected.Anchored
+			selected.Anchored = true
+
+			local hitPosition = mouse.Hit.Position
+			dragOffset = selected.Position - hitPosition
+			savedRotation = selected.CFrame - selected.Position
+
+			oldTargetFilter = mouse.TargetFilter
+			mouse.TargetFilter = selected
+
+			hoverHighlight.Adornee = selected
+			hoverHighlight.Enabled = true
+		end
+
+		track(tool.Equipped:Connect(function(mouse)
+			equipped = true
+
+			hoverConn = RunService.RenderStepped:Connect(function()
+				if not equipped then return end
+
+				if dragging and draggedPart and draggedPart.Parent then
+					local targetPosition = mouse.Hit.Position + dragOffset
+					draggedPart.CFrame = CFrame.new(targetPosition) * savedRotation
+					hoverHighlight.Adornee = draggedPart
+					hoverHighlight.Enabled = true
+					return
+				end
+
+				local target = mouse.Target
+				if isValidTarget(target) then
+					hoverHighlight.Adornee = target
+					hoverHighlight.Enabled = true
+				else
+					hoverHighlight.Adornee = nil
+					hoverHighlight.Enabled = false
+				end
+			end)
+
+			downConn = mouse.Button1Down:Connect(function()
+				local target = mouse.Target
+				if not isValidTarget(target) then return end
+
+				if mode == "DELETE" then
+					target:Destroy()
+					hoverHighlight.Adornee = nil
+					hoverHighlight.Enabled = false
+					return
+				end
+
+				beginDragging(mouse, target)
+			end)
+
+			upConn = mouse.Button1Up:Connect(function()
+				if dragging then
+					stopDragging(mouse)
+				end
+			end)
+
+			keyConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+				if gameProcessed or typingInTextBox() then return end
+				if not dragging or not draggedPart or not draggedPart.Parent then return end
+
+				-- R rotates horizontally around the Y axis.
+				if input.KeyCode == Enum.KeyCode.R then
+					savedRotation = savedRotation * CFrame.Angles(0, math.rad(90), 0)
+					draggedPart.CFrame = CFrame.new(draggedPart.Position) * savedRotation
+					return
+				end
+
+				-- V rotates vertically around the X axis.
+				if input.KeyCode == Enum.KeyCode.V then
+					savedRotation = savedRotation * CFrame.Angles(math.rad(90), 0, 0)
+					draggedPart.CFrame = CFrame.new(draggedPart.Position) * savedRotation
+				end
+			end)
+		end))
+
+		track(tool.Unequipped:Connect(function()
+			equipped = false
+
+			if hoverConn then
+				hoverConn:Disconnect()
+				hoverConn = nil
+			end
+
+			if downConn then
+				downConn:Disconnect()
+				downConn = nil
+			end
+
+			if upConn then
+				upConn:Disconnect()
+				upConn = nil
+			end
+
+			if keyConn then
+				keyConn:Disconnect()
+				keyConn = nil
+			end
+
+			stopDragging(nil)
+			hoverHighlight.Adornee = nil
+			hoverHighlight.Enabled = false
+		end))
+
+		track(tool.Destroying:Connect(function()
+			if hoverConn then hoverConn:Disconnect() end
+			if downConn then downConn:Disconnect() end
+			if upConn then upConn:Disconnect() end
+			if keyConn then keyConn:Disconnect() end
+			hoverHighlight:Destroy()
+		end))
+
+		return tool
+	end
+
+	makeTool("Move", Color3.fromRGB(80, 255, 120), "MOVE")
+	makeTool("Clone", Color3.fromRGB(80, 160, 255), "CLONE")
+	makeTool("Delete", Color3.fromRGB(255, 80, 80), "DELETE")
+end
+
+local function playerPassesFilter(otherPlayer)
+	if ENH.PlayerFilterMode == "ENEMIES" then return isEnemy(otherPlayer) end
+	if ENH.PlayerFilterMode == "TEAM" then return isTeammate(otherPlayer) end
+	return true
+end
+
+local function refreshPlayerFilterButtons()
+	for mode, button in pairs(ENH.PlayerFilterButtons) do
+		button.BackgroundColor3 = (mode == ENH.PlayerFilterMode) and THEME.BUTTON_ACTIVE or Color3.fromRGB(48, 51, 61)
+	end
+end
+
+local function rebuildPlayerList()
+	if not playerListFrame or not playerListLayout then return end
+	disconnectBucket(ENH.DynamicPlayerConnections)
+
+	for _, child in ipairs(playerListFrame:GetChildren()) do
+		if child:IsA("TextButton") or child.Name == "EmptyState" then
+			child:Destroy()
+		end
+	end
+
+	local query = ENH.PlayerSearchQuery:lower():gsub("^%s+", ""):gsub("%s+$", "")
+	local players = {}
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		if otherPlayer ~= player and playerPassesFilter(otherPlayer) then
+			local haystack = (otherPlayer.Name .. " " .. otherPlayer.DisplayName):lower()
+			if query == "" or haystack:find(query, 1, true) then
+				table.insert(players, otherPlayer)
+			end
+		end
+	end
+
+	table.sort(players, function(a, b)
+		local aRoot, bRoot = getHRP(a.Character), getHRP(b.Character)
+		local myRoot = getHRP(getCharacter())
+		if myRoot and aRoot and bRoot then
+			local ad = (aRoot.Position - myRoot.Position).Magnitude
+			local bd = (bRoot.Position - myRoot.Position).Magnitude
+			if math.abs(ad - bd) > 0.01 then return ad < bd end
+		end
+		return a.Name:lower() < b.Name:lower()
+	end)
+
+	if #players == 0 then
+		local empty = Instance.new("TextLabel")
+		empty.Name = "EmptyState"
+		empty.Size = UDim2.new(1, -12, 0, 38)
+		empty.BackgroundTransparency = 1
+		empty.Text = "No players match this search/filter."
+		empty.Font = Enum.Font.Gotham
+		empty.TextSize = 12
+		empty.TextColor3 = THEME.SUBTEXT
+		empty.Parent = playerListFrame
+		return
+	end
+
+	for index, otherPlayer in ipairs(players) do
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.new(1, -12, 0, 36)
+		if otherPlayer.DisplayName ~= otherPlayer.Name then
+			button.Text = otherPlayer.DisplayName .. "   @" .. otherPlayer.Name
+		else
+			button.Text = "@" .. otherPlayer.Name
+		end
+		button.Font = Enum.Font.Gotham
+		button.TextSize = 12
+		button.TextColor3 = THEME.TEXT
+		button.TextXAlignment = Enum.TextXAlignment.Left
+		button.BackgroundColor3 = bringingTargets[otherPlayer] and THEME.BUTTON_ACTIVE or Color3.fromRGB(48, 51, 61)
+		button.BorderSizePixel = 0
+		button.ZIndex = 3
+		button.LayoutOrder = index
+		button.Parent = playerListFrame
+		addCorner(button, 8)
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 10)
+		padding.PaddingRight = UDim.new(0, 10)
+		padding.Parent = button
+
+		track(button.MouseButton1Click:Connect(function()
+			if activeAction == "TELEPORT" then
+				teleportToPlayer(otherPlayer)
+			else
+				toggleBringing(otherPlayer)
+				rebuildPlayerList()
+			end
+		end), ENH.DynamicPlayerConnections)
+	end
+end
+
+local function buildWindow()
+	window = Instance.new("Frame")
+	window.BackgroundColor3 = THEME.BG
+	window.BorderSizePixel = 0
+	window.AnchorPoint = Vector2.new(0.5, 0.5)
+	window.Position = UDim2.new(0.5, 0, 0.5, 0)
+	window.Size = UDim2.new(0, 0, 0, 0)
+	window.Visible = false
+	window.ClipsDescendants = true
+	window.Parent = gui
+	addCorner(window, 14)
+
+	local uiScale = Instance.new("UIScale")
+	uiScale.Scale = 1
+	uiScale.Parent = window
+
+	local function refreshScale()
+		local cam = workspace.CurrentCamera
+		if not cam then return end
+		local viewport = cam.ViewportSize
+		local fit = math.min(
+			(viewport.X - 24) / CONFIG.PanelWidth,
+			(viewport.Y - 24) / CONFIG.PanelHeight
+		)
+		uiScale.Scale = math.min(1, math.max(0.5, fit))
+	end
+	refreshScale()
+	track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(refreshScale))
+	if workspace.CurrentCamera then
+		track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshScale))
+	end
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = THEME.OUTLINE
+	stroke.Thickness = 1
+	stroke.Parent = window
+
+	local header = Instance.new("Frame")
+	header.Size = UDim2.new(1, 0, 0, CONFIG.HeaderHeight)
+	header.BackgroundColor3 = THEME.BG
+	header.BorderSizePixel = 0
+	header.ZIndex = 10
+	header.Active = true
+	header.Parent = window
+	addCorner(header, 14)
+
+	local headerLine = Instance.new("Frame")
+	headerLine.Size = UDim2.new(1, -20, 0, 1)
+	headerLine.Position = UDim2.new(0, 10, 1, -1)
+	headerLine.BackgroundColor3 = THEME.OUTLINE
+	headerLine.BorderSizePixel = 0
+	headerLine.ZIndex = 11
+	headerLine.Parent = header
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.new(0, 14, 0, 8)
+	title.Size = UDim2.new(1, -62, 0, 22)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 16
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = THEME.TEXT
+	title.Text = "r0onk's Menu"
+	title.ZIndex = 11
+	title.Parent = header
+
+	ENH.HeaderHintLabel = Instance.new("TextLabel")
+	ENH.HeaderHintLabel.BackgroundTransparency = 1
+	ENH.HeaderHintLabel.Position = UDim2.new(0, 14, 0, 32)
+	ENH.HeaderHintLabel.Size = UDim2.new(1, -62, 0, 16)
+	ENH.HeaderHintLabel.Font = Enum.Font.Gotham
+	ENH.HeaderHintLabel.TextSize = 11
+	ENH.HeaderHintLabel.TextXAlignment = Enum.TextXAlignment.Left
+	ENH.HeaderHintLabel.TextColor3 = THEME.SUBTEXT
+	ENH.HeaderHintLabel.ZIndex = 11
+	ENH.HeaderHintLabel.Parent = header
+	refreshHeaderGreeting()
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Size = UDim2.new(0, 34, 0, 34)
+	closeBtn.Position = UDim2.new(1, -40, 0, 13)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(50, 36, 40)
+	closeBtn.Text = "X"
+	closeBtn.Font = Enum.Font.GothamBold
+	closeBtn.TextSize = 17
+	closeBtn.TextColor3 = THEME.DANGER
+	closeBtn.AutoButtonColor = false
+	closeBtn.ZIndex = 12
+	closeBtn.BorderSizePixel = 0
+	closeBtn.Parent = header
+	addCorner(closeBtn, 9)
+
+	frame = Instance.new("ScrollingFrame")
+	frame.Size = UDim2.new(1, 0, 1, -CONFIG.HeaderHeight)
+	frame.Position = UDim2.new(0, 0, 0, CONFIG.HeaderHeight)
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.ScrollBarThickness = 5
+	frame.ScrollBarImageColor3 = THEME.SUBTEXT
+	frame.ScrollingDirection = Enum.ScrollingDirection.Y
+	frame.ElasticBehavior = Enum.ElasticBehavior.Never
+	frame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	frame.CanvasSize = UDim2.new(0, 0, 0, 0)
+	frame.ClipsDescendants = true
+	frame.ZIndex = 2
+	frame.Parent = window
+
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 12)
+	pad.PaddingBottom = UDim.new(0, 16)
+	pad.PaddingLeft = UDim.new(0, 18)
+	pad.PaddingRight = UDim.new(0, 18)
+	pad.Parent = frame
+
+	local listLayout = Instance.new("UIListLayout")
+	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	listLayout.Padding = UDim.new(0, 10)
+	listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	listLayout.Parent = frame
+
+
+	-- MOVEMENT ===================================================
+	makeSection("Movement", true, function()
+
+		flyBtn = makeToggleRow("Fly", 36)
+		track(flyBtn.button.MouseButton1Click:Connect(function() setFlying(not flying) end))
+		setToggleWidget(flyBtn, flying, "Fly")
+
+		noclipBtn = makeToggleRow("Noclip", 34)
+		track(noclipBtn.button.MouseButton1Click:Connect(function() setNoclip(not noclip) end))
+		setToggleWidget(noclipBtn, noclip, "Noclip")
+
+		infJumpBtn = makeToggleRow("Infinite Jump", 34)
+		track(infJumpBtn.button.MouseButton1Click:Connect(function()
+			infJump = not infJump
+			setToggleWidget(infJumpBtn, infJump, "Infinite Jump")
+		end))
+		setToggleWidget(infJumpBtn, infJump, "Infinite Jump")
+
+		ghostBtn = makeToggleRow("Ghost / Freecam Body", 34)
+		track(ghostBtn.button.MouseButton1Click:Connect(function() setGhostMode(not ghostEnabled) end))
+		setToggleWidget(ghostBtn, ghostEnabled, "Ghost / Freecam Body")
+
+		swapBtn = makeButton("SWAP BODY ↔ GHOST", 32)
+		swapBtn.TextSize = 11
+		track(swapBtn.MouseButton1Click:Connect(swapBodyGhost))
+		refreshGhostUI()
+
+		makeLabel("Speed Controls", THEME.SUBTEXT, 18, 13)
+		makeNumberControl({
+			Title = "Fly Speed", LabelPrefix = "Fly Speed: ",
+			Min = CONFIG.FlySpeed.Min, Max = CONFIG.FlySpeed.Max, Value = flySpeed,
+			OnChanged = function(v) flySpeed = v; ENH.GamePrefs.FlySpeed = v; scheduleSaveSettings() end,
+		})
+
+		ENH.WalkSpeedControlSetter = makeNumberControl({
+			Title = "Walk Speed", LabelPrefix = "Walk Speed: ",
+			Min = CONFIG.WalkSpeed.Min, Max = CONFIG.WalkSpeed.Max, Value = walkSpeed,
+			OnChanged = function(v)
+				walkSpeed = v
+				ENH.WalkSpeedLocked = true
+				applyWalkSpeed()
+				scheduleSaveSettings()
+			end,
+		})
+
+		ENH.JumpPowerControlSetter = makeNumberControl({
+			Title = "Jump Power", LabelPrefix = "Jump Power: ",
+			Min = CONFIG.JumpPower.Min, Max = CONFIG.JumpPower.Max, Value = jumpPower,
+			OnChanged = function(v)
+				jumpPower = v
+				ENH.JumpPowerLocked = true
+				applyJumpPower()
+				scheduleSaveSettings()
+			end,
+		})
+
+		local restoreStatsBtn = makeButton("Restore Game Walk/Jump", 32)
+		restoreStatsBtn.BackgroundColor3 = Color3.fromRGB(55, 58, 69)
+		restoreStatsBtn.TextSize = 12
+		track(restoreStatsBtn.MouseButton1Click:Connect(function()
+			restoreGameStats(true)
+		end))
+	end)
+
+	-- COMBAT =====================================================
+	makeSection("Combat", false, function()
+
+		aimLockBtn = makeToggleRow("Aimbot", 34)
+		track(aimLockBtn.button.MouseButton1Click:Connect(function() setAimLockEnabled(not aimLockEnabled) end))
+		setToggleWidget(aimLockBtn, aimLockEnabled, "Aimbot")
+
+		aimTargetLabel = makeLabel("Target: None", THEME.SUBTEXT, 18, 12)
+
+		makeNumberControl({
+			Title = "Aimbot Max Distance", HideTitle = true, LabelPrefix = "Max target distance: ",
+			Min = CONFIG.AIMLOCK.MaxDistanceMin, Max = CONFIG.AIMLOCK.MaxDistanceMax, Value = aimMaxDistance,
+			OnChanged = function(v)
+				aimMaxDistance = v
+				ENH.GamePrefs.AimMaxDistance = v
+				scheduleSaveSettings()
+				if aimCurrentTarget and not AimCore.validTarget(aimCurrentTarget) then
+					aimCurrentTarget = nil
+					updateAimlockUI()
+				end
+			end,
+		})
+
+		makeLabel("Target Teams", THEME.SUBTEXT, 18, 13)
+		aimTeamScroll = Instance.new("ScrollingFrame")
+		aimTeamScroll.Name = "AimbotTeamFilter"
+		aimTeamScroll.Size = UDim2.new(1, 0, 0, 116)
+		aimTeamScroll.BackgroundColor3 = Color3.fromRGB(38, 41, 49)
+		aimTeamScroll.BorderSizePixel = 0
+		aimTeamScroll.ScrollBarThickness = 5
+		aimTeamScroll.ScrollBarImageColor3 = THEME.SUBTEXT
+		aimTeamScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+		aimTeamScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		aimTeamScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+		aimTeamScroll.ElasticBehavior = Enum.ElasticBehavior.Never
+		aimTeamScroll.LayoutOrder = nextOrder()
+		aimTeamScroll.ZIndex = 3
+		aimTeamScroll.Parent = currentUIParent or frame
+		addCorner(aimTeamScroll, 10)
+
+		local aimTeamPadding = Instance.new("UIPadding")
+		aimTeamPadding.PaddingTop = UDim.new(0, 6)
+		aimTeamPadding.PaddingBottom = UDim.new(0, 6)
+		aimTeamPadding.PaddingLeft = UDim.new(0, 6)
+		aimTeamPadding.PaddingRight = UDim.new(0, 6)
+		aimTeamPadding.Parent = aimTeamScroll
+
+		local aimTeamLayout = Instance.new("UIListLayout")
+		aimTeamLayout.Padding = UDim.new(0, 6)
+		aimTeamLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		aimTeamLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		aimTeamLayout.Parent = aimTeamScroll
+		rebuildAimTeamButtons()
+	end)
+
+	-- VISUALS ====================================================
+	makeSection("Visuals / ESP", false, function()
+
+		espBtn = makeToggleRow("ESP", 34)
+		track(espBtn.button.MouseButton1Click:Connect(function()
+			setESPEnabled(not espEnabled)
+			updateESPButtons()
+		end))
+
+		makeLabel("Show Players", THEME.SUBTEXT, 18, 13)
+		local modeGrid = Instance.new("Frame")
+		modeGrid.Size = UDim2.new(1, 0, 0, 34)
+		modeGrid.BackgroundTransparency = 1
+		modeGrid.LayoutOrder = nextOrder()
+		modeGrid.Parent = currentUIParent or frame
+
+		local modeLayout = Instance.new("UIGridLayout")
+		modeLayout.CellSize = UDim2.new(1 / 3, -6, 0, 34)
+		modeLayout.CellPadding = UDim2.fromOffset(8, 0)
+		modeLayout.FillDirectionMaxCells = 3
+		modeLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		modeLayout.Parent = modeGrid
+
+		local function addModeChoice(labelText, mode)
+			local widget = makeCheckButton(modeGrid, labelText)
+			widget.button.Size = UDim2.fromScale(1, 1)
+			espModeBtns[mode] = widget
+			track(widget.button.MouseButton1Click:Connect(function()
+				setESPMode(mode)
+				ENH.GamePrefs.ESPMode = mode
+				scheduleSaveSettings()
+				updateESPButtons()
+			end))
+		end
+		addModeChoice("All", "ALL")
+		addModeChoice("Team", "TEAM")
+		addModeChoice("Enemies", "ENEMIES")
+
+		makeLabel("Display", THEME.SUBTEXT, 18, 13)
+		local optionGrid = Instance.new("Frame")
+		optionGrid.Size = UDim2.new(1, 0, 0, 76)
+		optionGrid.BackgroundTransparency = 1
+		optionGrid.LayoutOrder = nextOrder()
+		optionGrid.Parent = currentUIParent or frame
+
+		local optionLayout = Instance.new("UIGridLayout")
+		optionLayout.CellSize = UDim2.new(0.5, -4, 0, 34)
+		optionLayout.CellPadding = UDim2.fromOffset(8, 8)
+		optionLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		optionLayout.Parent = optionGrid
+
+		espNameBtn = makeCheckButton(optionGrid, "Names")
+		espNameBtn.button.Size = UDim2.fromScale(1, 1)
+		track(espNameBtn.button.MouseButton1Click:Connect(function()
+			espNameTags = not espNameTags; ENH.GamePrefs.ESPNameTags = espNameTags; scheduleSaveSettings(); refreshAllESP(); updateESPButtons()
+		end))
+
+		espDistanceBtn = makeCheckButton(optionGrid, "Distance")
+		espDistanceBtn.button.Size = UDim2.fromScale(1, 1)
+		track(espDistanceBtn.button.MouseButton1Click:Connect(function()
+			espDistanceTags = not espDistanceTags; ENH.GamePrefs.ESPDistanceTags = espDistanceTags; scheduleSaveSettings(); refreshAllESP(); updateESPButtons()
+		end))
+
+		espTeamColorBtn = makeCheckButton(optionGrid, "Team Colors")
+		espTeamColorBtn.button.Size = UDim2.fromScale(1, 1)
+		track(espTeamColorBtn.button.MouseButton1Click:Connect(function()
+			espTeamColors = not espTeamColors; ENH.GamePrefs.ESPTeamColors = espTeamColors; scheduleSaveSettings(); refreshAllESP(); updateESPButtons()
+		end))
+
+		espHealthBtn = makeCheckButton(optionGrid, "Health Bars")
+		espHealthBtn.button.Size = UDim2.fromScale(1, 1)
+		track(espHealthBtn.button.MouseButton1Click:Connect(function()
+			espHealthBars = not espHealthBars; ENH.GamePrefs.ESPHealthBars = espHealthBars; scheduleSaveSettings(); refreshAllESP(); updateESPButtons()
+		end))
+
+		makeNumberControl({
+			Title = "ESP Max Distance", HideTitle = true, LabelPrefix = "ESP distance: ",
+			Min = CONFIG.ESP.MaxDistanceMin, Max = CONFIG.ESP.MaxDistanceMax, Value = espMaxDistance,
+			OnChanged = function(v)
+				espMaxDistance = v; ENH.GamePrefs.ESPMaxDistance = v; scheduleSaveSettings()
+				for _, bar in pairs(hpBars) do bar.MaxDistance = espMaxDistance end
+				refreshAllESP()
+			end,
+		})
+		updateESPButtons()
+	end)
+
+	-- PLAYERS & TOOLS ===========================================
+	makeSection("Players & Tools", false, function()
+
+		makeLabel("Action", THEME.SUBTEXT, 18, 13)
+		local actionModeRow = Instance.new("Frame")
+		actionModeRow.Size = UDim2.new(1, 0, 0, 36)
+		actionModeRow.BackgroundColor3 = Color3.fromRGB(48, 51, 61)
+		actionModeRow.BorderSizePixel = 0
+		actionModeRow.LayoutOrder = nextOrder()
+		actionModeRow.Parent = currentUIParent or frame
+		addCorner(actionModeRow, 10)
+
+		local teleportBtn = Instance.new("TextButton")
+		teleportBtn.Size = UDim2.new(0.5, -2, 1, 0)
+		teleportBtn.Text = "Teleport"
+		teleportBtn.Font = Enum.Font.GothamMedium
+		teleportBtn.TextSize = 13
+		teleportBtn.TextColor3 = THEME.TEXT
+		teleportBtn.AutoButtonColor = false
+		teleportBtn.BorderSizePixel = 0
+		teleportBtn.Parent = actionModeRow
+		addCorner(teleportBtn, 9)
+
+		local bringBtn = Instance.new("TextButton")
+		bringBtn.Size = UDim2.new(0.5, -2, 1, 0)
+		bringBtn.Position = UDim2.new(0.5, 2, 0, 0)
+		bringBtn.Text = "Bring"
+		bringBtn.Font = Enum.Font.GothamMedium
+		bringBtn.TextSize = 13
+		bringBtn.TextColor3 = THEME.TEXT
+		bringBtn.AutoButtonColor = false
+		bringBtn.BorderSizePixel = 0
+		bringBtn.Parent = actionModeRow
+		addCorner(bringBtn, 9)
+
+		local function refreshActionButtons()
+			teleportBtn.BackgroundColor3 = activeAction == "TELEPORT" and THEME.BUTTON_ACTIVE or Color3.fromRGB(48, 51, 61)
+			bringBtn.BackgroundColor3 = activeAction == "BRING" and THEME.BUTTON_ACTIVE or Color3.fromRGB(48, 51, 61)
+		end
+		track(teleportBtn.MouseButton1Click:Connect(function()
+			activeAction = "TELEPORT"; refreshActionButtons(); updateBringStatus(); rebuildPlayerList()
+		end))
+		track(bringBtn.MouseButton1Click:Connect(function()
+			activeAction = "BRING"; refreshActionButtons(); updateBringStatus(); rebuildPlayerList()
+		end))
+		refreshActionButtons()
+
+		bringStatusLabel = makeLabel("Click a player to teleport behind them.", THEME.ACCENT, 28, 11)
+		bringStatusLabel.TextWrapped = true
+
+		makeLabel("Find Players", THEME.SUBTEXT, 18, 13)
+		ENH.PlayerSearchBox = Instance.new("TextBox")
+		ENH.PlayerSearchBox.Size = UDim2.new(1, 0, 0, 34)
+		ENH.PlayerSearchBox.BackgroundColor3 = Color3.fromRGB(62, 66, 78)
+		ENH.PlayerSearchBox.TextColor3 = THEME.TEXT
+		ENH.PlayerSearchBox.PlaceholderColor3 = THEME.SUBTEXT
+		ENH.PlayerSearchBox.PlaceholderText = "Search display name or @username..."
+		ENH.PlayerSearchBox.Text = ""
+		ENH.PlayerSearchBox.ClearTextOnFocus = false
+		ENH.PlayerSearchBox.Font = Enum.Font.Gotham
+		ENH.PlayerSearchBox.TextSize = 12
+		ENH.PlayerSearchBox.BorderSizePixel = 0
+		ENH.PlayerSearchBox.LayoutOrder = nextOrder()
+		ENH.PlayerSearchBox.Parent = currentUIParent or frame
+		addCorner(ENH.PlayerSearchBox, 8)
+		track(ENH.PlayerSearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+			ENH.PlayerSearchQuery = ENH.PlayerSearchBox.Text
+			rebuildPlayerList()
+		end))
+
+		local filterGrid = Instance.new("Frame")
+		filterGrid.Size = UDim2.new(1, 0, 0, 32)
+		filterGrid.BackgroundTransparency = 1
+		filterGrid.LayoutOrder = nextOrder()
+		filterGrid.Parent = currentUIParent or frame
+		local filterLayout = Instance.new("UIGridLayout")
+		filterLayout.CellSize = UDim2.new(1/3, -6, 0, 32)
+		filterLayout.CellPadding = UDim2.fromOffset(8, 0)
+		filterLayout.FillDirectionMaxCells = 3
+		filterLayout.Parent = filterGrid
+		for _, info in ipairs({{"All", "ALL"}, {"Enemies", "ENEMIES"}, {"Team", "TEAM"}}) do
+			local btn = Instance.new("TextButton")
+			btn.Size = UDim2.fromScale(1, 1)
+			btn.Text = info[1]
+			btn.Font = Enum.Font.GothamMedium
+			btn.TextSize = 11
+			btn.TextColor3 = THEME.TEXT
+			btn.BorderSizePixel = 0
+			btn.AutoButtonColor = false
+			btn.Parent = filterGrid
+			addCorner(btn, 8)
+			ENH.PlayerFilterButtons[info[2]] = btn
+			track(btn.MouseButton1Click:Connect(function()
+				ENH.PlayerFilterMode = info[2]
+				refreshPlayerFilterButtons()
+				rebuildPlayerList()
+			end))
+		end
+		refreshPlayerFilterButtons()
+
+		playerListFrame = Instance.new("ScrollingFrame")
+		playerListFrame.Size = UDim2.new(1, 0, 0, 164)
+		playerListFrame.BackgroundColor3 = Color3.fromRGB(38, 41, 49)
+		playerListFrame.BorderSizePixel = 0
+		playerListFrame.ScrollBarThickness = 5
+		playerListFrame.ScrollBarImageColor3 = THEME.SUBTEXT
+		playerListFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+		playerListFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		playerListFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+		playerListFrame.ElasticBehavior = Enum.ElasticBehavior.Never
+		playerListFrame.LayoutOrder = nextOrder()
+		playerListFrame.Parent = currentUIParent or frame
+		addCorner(playerListFrame, 10)
+
+		local playerListPadding = Instance.new("UIPadding")
+		playerListPadding.PaddingTop = UDim.new(0, 8)
+		playerListPadding.PaddingBottom = UDim.new(0, 8)
+		playerListPadding.PaddingLeft = UDim.new(0, 6)
+		playerListPadding.PaddingRight = UDim.new(0, 6)
+		playerListPadding.Parent = playerListFrame
+		playerListLayout = Instance.new("UIListLayout")
+		playerListLayout.Padding = UDim.new(0, 6)
+		playerListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		playerListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		playerListLayout.Parent = playerListFrame
+
+		makeLabel("Bulk Bring", THEME.SUBTEXT, 18, 13)
+		local bulkGrid = Instance.new("Frame")
+		bulkGrid.Size = UDim2.new(1, 0, 0, 32)
+		bulkGrid.BackgroundTransparency = 1
+		bulkGrid.LayoutOrder = nextOrder()
+		bulkGrid.Parent = currentUIParent or frame
+		local bulkLayout = Instance.new("UIGridLayout")
+		bulkLayout.CellSize = UDim2.new(1/3, -6, 0, 32)
+		bulkLayout.CellPadding = UDim2.fromOffset(8, 0)
+		bulkLayout.FillDirectionMaxCells = 3
+		bulkLayout.Parent = bulkGrid
+
+		local function bulkButton(text, callback, danger)
+			local btn = Instance.new("TextButton")
+			btn.Text = text
+			btn.Font = Enum.Font.GothamMedium
+			btn.TextSize = 11
+			btn.TextColor3 = THEME.TEXT
+			btn.BackgroundColor3 = danger and THEME.DANGER or Color3.fromRGB(48, 51, 61)
+			btn.BorderSizePixel = 0
+			btn.AutoButtonColor = false
+			btn.Parent = bulkGrid
+			addCorner(btn, 8)
+			track(btn.MouseButton1Click:Connect(function() callback(); rebuildPlayerList() end))
+		end
+		bulkButton("Bring All", bringAllPlayers)
+		bulkButton("Bring Enemies", bringEnemyPlayers)
+		bulkButton("Stop", stopBringingAll, true)
+
+		makeLabel("Local Tools", THEME.SUBTEXT, 18, 13)
+		local utilityRow = Instance.new("Frame")
+		utilityRow.Size = UDim2.new(1, 0, 0, 34)
+		utilityRow.BackgroundTransparency = 1
+		utilityRow.LayoutOrder = nextOrder()
+		utilityRow.Parent = currentUIParent or frame
+
+		local teleportToolBtn = Instance.new("TextButton")
+		teleportToolBtn.Size = UDim2.new(0.5, -4, 1, 0)
+		teleportToolBtn.Text = "Teleport Tool"
+		teleportToolBtn.BackgroundColor3 = Color3.fromRGB(48, 51, 61)
+		teleportToolBtn.TextColor3 = THEME.TEXT
+		teleportToolBtn.Font = Enum.Font.GothamMedium
+		teleportToolBtn.TextSize = 11
+		teleportToolBtn.BorderSizePixel = 0
+		teleportToolBtn.AutoButtonColor = false
+		teleportToolBtn.Parent = utilityRow
+		addCorner(teleportToolBtn, 9)
+
+		local btoolsBtn = teleportToolBtn:Clone()
+		btoolsBtn.Text = "Give BTools"
+		btoolsBtn.Position = UDim2.new(0.5, 4, 0, 0)
+		btoolsBtn.Parent = utilityRow
+		track(teleportToolBtn.MouseButton1Click:Connect(giveTeleportTool))
+		track(btoolsBtn.MouseButton1Click:Connect(giveBTools))
+	end)
+
+	-- SERVER =====================================================
+	makeSection("Server", false, function()
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, 0, 0, 34)
+		row.BackgroundTransparency = 1
+		row.LayoutOrder = nextOrder()
+		row.Parent = currentUIParent or frame
+
+		local rejoinBtn = Instance.new("TextButton")
+		rejoinBtn.Size = UDim2.new(0.5, -4, 1, 0)
+		rejoinBtn.Text = "Rejoin Server"
+		rejoinBtn.BackgroundColor3 = Color3.fromRGB(48, 51, 61)
+		rejoinBtn.TextColor3 = THEME.TEXT
+		rejoinBtn.Font = Enum.Font.GothamMedium
+		rejoinBtn.TextSize = 11
+		rejoinBtn.BorderSizePixel = 0
+		rejoinBtn.AutoButtonColor = false
+		rejoinBtn.Parent = row
+		addCorner(rejoinBtn, 9)
+
+		local hopBtn = rejoinBtn:Clone()
+		hopBtn.Text = "Server Hop"
+		hopBtn.Position = UDim2.new(0.5, 4, 0, 0)
+		hopBtn.Parent = row
+
+		track(rejoinBtn.MouseButton1Click:Connect(function()
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+		end))
+		track(hopBtn.MouseButton1Click:Connect(function()
+			task.spawn(function()
+				local ok, body = pcall(function()
+					return game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true")
+				end)
+				if not ok then return end
+				local parsedOk, decoded = pcall(HttpService.JSONDecode, HttpService, body)
+				if not parsedOk or type(decoded) ~= "table" or type(decoded.data) ~= "table" then return end
+				local servers = {}
+				for _, server in ipairs(decoded.data) do
+					if server.id ~= game.JobId and tonumber(server.playing) and tonumber(server.maxPlayers) and server.playing < server.maxPlayers then
+						table.insert(servers, server.id)
+					end
+				end
+				if #servers > 0 then
+					TeleportService:TeleportToPlaceInstance(game.PlaceId, servers[math.random(1, #servers)], player)
+				end
+			end)
+		end))
+	end)
+
+	-- SETTINGS ===================================================
+	makeSection("Settings", false, function()
+		makeLabel("Hotkeys", THEME.SUBTEXT, 18, 13)
+
+		local actions = {
+			{"Open Menu", "Open"},
+			{"Fly", "Fly"},
+			{"Noclip", "Noclip"},
+			{"Infinite Jump", "InfJump"},
+			{"Aimbot", "Aimbot"},
+		}
+
+		local function keyAlreadyUsed(key, exceptAction)
+			for action, existing in pairs(CONFIG.Keys) do
+				if action ~= exceptAction and existing == key then return action end
+			end
+			return nil
+		end
+
+		local function refreshKeybindUI()
+			for action, button in pairs(ENH.KeybindButtons) do
+				button.Text = keyToText(CONFIG.Keys[action])
+			end
+			refreshHeaderGreeting()
+		end
+
+		local function beginKeyCapture(action)
+			if ENH.KeyCaptureConnection then ENH.KeyCaptureConnection:Disconnect(); ENH.KeyCaptureConnection = nil end
+			ENH.CapturingKeybind = true
+			local button = ENH.KeybindButtons[action]
+			if button then button.Text = "Press a key..." end
+			if ENH.KeybindStatusLabel then ENH.KeybindStatusLabel.Text = "Listening for " .. action .. "..." end
+
+			ENH.KeyCaptureConnection = UserInputService.InputBegan:Connect(function(input)
+				if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+				ENH.KeyCaptureConnection:Disconnect()
+				ENH.KeyCaptureConnection = nil
+				ENH.CapturingKeybind = false
+
+				if input.KeyCode == Enum.KeyCode.Escape then
+					if ENH.KeybindStatusLabel then ENH.KeybindStatusLabel.Text = "Key change cancelled." end
+					refreshKeybindUI()
+					return
+				end
+
+				local conflict = keyAlreadyUsed(input.KeyCode, action)
+				if conflict then
+					if ENH.KeybindStatusLabel then ENH.KeybindStatusLabel.Text = keyToText(input.KeyCode) .. " is already assigned to " .. conflict .. "." end
+					refreshKeybindUI()
+					return
+				end
+
+				CONFIG.Keys[action] = input.KeyCode
+				ENH.AllSettings.global.Keys = ENH.AllSettings.global.Keys or {}
+				ENH.AllSettings.global.Keys[action] = input.KeyCode.Name
+				scheduleSaveSettings()
+				if ENH.KeybindStatusLabel then ENH.KeybindStatusLabel.Text = action .. " → " .. keyToText(input.KeyCode) end
+				refreshKeybindUI()
+			end)
+		end
+
+		for _, info in ipairs(actions) do
+			local row = Instance.new("Frame")
+			row.Size = UDim2.new(1, 0, 0, 32)
+			row.BackgroundColor3 = Color3.fromRGB(48, 51, 61)
+			row.BorderSizePixel = 0
+			row.LayoutOrder = nextOrder()
+			row.Parent = currentUIParent or frame
+			addCorner(row, 8)
+
+			local label = Instance.new("TextLabel")
+			label.Size = UDim2.new(1, -112, 1, 0)
+			label.Position = UDim2.new(0, 10, 0, 0)
+			label.BackgroundTransparency = 1
+			label.Text = info[1]
+			label.Font = Enum.Font.Gotham
+			label.TextSize = 12
+			label.TextXAlignment = Enum.TextXAlignment.Left
+			label.TextColor3 = THEME.TEXT
+			label.Parent = row
+
+			local keyBtn = Instance.new("TextButton")
+			keyBtn.Size = UDim2.new(0, 96, 0, 24)
+			keyBtn.Position = UDim2.new(1, -102, 0.5, -12)
+			keyBtn.BackgroundColor3 = THEME.BUTTON
+			keyBtn.TextColor3 = THEME.ACCENT
+			keyBtn.Font = Enum.Font.GothamBold
+			keyBtn.TextSize = 11
+			keyBtn.BorderSizePixel = 0
+			keyBtn.AutoButtonColor = false
+			keyBtn.Parent = row
+			addCorner(keyBtn, 7)
+			ENH.KeybindButtons[info[2]] = keyBtn
+			track(keyBtn.MouseButton1Click:Connect(function() beginKeyCapture(info[2]) end))
+		end
+
+		ENH.KeybindStatusLabel = makeLabel(ENH.CanPersist and "Preferences: saving enabled" or "Preferences: session only (file API unavailable)", THEME.SUBTEXT, 20, 11)
+		refreshKeybindUI()
+
+	end)
+
+	-- Decorative full-body r0onk avatar footer. Keeping this inside the main
+	-- ScrollingFrame makes its placement deterministic: when every section is
+	-- collapsed it sits naturally in the spare area below Settings, and when the
+	-- menu grows it simply moves with the content instead of overlapping controls.
+	do
+		local avatarUserId = 32713511
+		local avatarFooter = Instance.new("Frame")
+		avatarFooter.Name = "r0onk_AvatarFooter"
+		avatarFooter.Size = UDim2.new(1, 0, 0, 104)
+		avatarFooter.BackgroundTransparency = 1
+		avatarFooter.BorderSizePixel = 0
+		avatarFooter.LayoutOrder = nextOrder()
+		avatarFooter.ZIndex = 2
+		avatarFooter.Parent = frame
+
+		local avatar = Instance.new("ImageLabel")
+		avatar.Name = "r0onk_FullAvatar"
+		avatar.AnchorPoint = Vector2.new(0.5, 0.5)
+		avatar.Position = UDim2.fromScale(0.5, 0.5)
+		avatar.Size = UDim2.fromOffset(100, 100)
+		avatar.BackgroundTransparency = 1
+		avatar.BorderSizePixel = 0
+		avatar.ScaleType = Enum.ScaleType.Fit
+		avatar.ZIndex = 3
+		-- Immediate engine thumbnail fallback so the image has something to resolve
+		-- even before GetUserThumbnailAsync finishes.
+		avatar.Image = "rbxthumb://type=Avatar&id=" .. avatarUserId .. "&w=420&h=420"
+		avatar.Parent = avatarFooter
+
+		-- AvatarThumbnail is Roblox's full-body thumbnail type. Retry briefly because
+		-- Roblox can report a thumbnail as not ready on the first request.
+		task.spawn(function()
+			for _ = 1, 6 do
+				if not alive or not avatar or not avatar.Parent then return end
+				local ok, image, ready = pcall(function()
+					return Players:GetUserThumbnailAsync(
+						avatarUserId,
+						Enum.ThumbnailType.AvatarThumbnail,
+						Enum.ThumbnailSize.Size420x420
+					)
+				end)
+
+				if ok and image and image ~= "" then
+					avatar.Image = image
+					if ready then return end
+				end
+				task.wait(0.4)
+			end
+		end)
+	end
+
+	local openTween = TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+	local closeTween = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	local openBusy = false
+
+	local function animateOpen()
+		if openBusy then return end
+		openBusy = true
+		window.Visible = true
+		window.Size = UDim2.new(0, 0, 0, 0)
+		rebuildPlayerList()
+		local tween = TweenService:Create(window, openTween, {Size = UDim2.new(0, CONFIG.PanelWidth, 0, CONFIG.PanelHeight)})
+		tween:Play()
+		tween.Completed:Once(function() openBusy = false end)
+	end
+
+	local function animateClose()
+		if openBusy then return end
+		openBusy = true
+		local tween = TweenService:Create(window, closeTween, {Size = UDim2.new(0, 0, 0, 0)})
+		tween:Play()
+		tween.Completed:Once(function()
+			if window then window.Visible = false end
+			openBusy = false
+		end)
+	end
+
+	track(closeBtn.MouseButton1Click:Connect(function()
+		if type(ENH.Env.r0onk_Unload) == "function" then ENH.Env.r0onk_Unload() end
+	end))
+
+	-- Drag only from the header and clamp the panel so it cannot be lost off-screen.
+	do
+		local dragging = false
+		local dragStart
+		local startPos
+		track(header.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragging = true
+				dragStart = input.Position
+				startPos = window.Position
+			end
+		end))
+		track(UserInputService.InputChanged:Connect(function(input)
+			if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+				local delta = input.Position - dragStart
+				local cam = workspace.CurrentCamera
+				local viewport = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+				local halfW = CONFIG.PanelWidth * uiScale.Scale * 0.5
+				local halfH = CONFIG.PanelHeight * uiScale.Scale * 0.5
+				local minX = -viewport.X * 0.5 + halfW
+				local maxX = viewport.X * 0.5 - halfW
+				local minY = -viewport.Y * 0.5 + halfH
+				local maxY = viewport.Y * 0.5 - halfH
+				window.Position = UDim2.new(0.5, math.clamp(startPos.X.Offset + delta.X, minX, maxX), 0.5, math.clamp(startPos.Y.Offset + delta.Y, minY, maxY))
+			end
+		end))
+		track(UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+		end))
+	end
+
+	window:SetAttribute("Built", true)
+	ENH.Env.r0onk_ToggleWindow = function()
+		if not alive or not window then return end
+		if not window.Visible then animateOpen() else animateClose() end
+	end
+end
+
+-- ===== INPUT / LOOPS =====
+local function toggleWindow()
+	if ENH.Env.r0onk_ToggleWindow then
+		ENH.Env.r0onk_ToggleWindow()
+	end
+end
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not alive or ENH.CapturingKeybind then return end
+	if gameProcessed then return end
+
+	if typingInTextBox() and input.KeyCode ~= CONFIG.Keys.Open then return end
+
+	if input.KeyCode == CONFIG.Keys.Open then toggleWindow(); return end
+	if input.KeyCode == CONFIG.Keys.Fly then setFlying(not flying); return end
+	if input.KeyCode == CONFIG.Keys.Noclip then setNoclip(not noclip); return end
+	if input.KeyCode == CONFIG.Keys.InfJump then
+		infJump = not infJump
+		setToggleWidget(infJumpBtn, infJump, "Infinite Jump")
+		return
+	end
+	if input.KeyCode == CONFIG.Keys.Aimbot then setAimLockEnabled(not aimLockEnabled); return end
+end))
+
+track(UserInputService.InputEnded:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.Space then
+		infArmed = true
+	end
+end))
+
+track(UserInputService.JumpRequest:Connect(function()
+	if not alive then return end
+	if not infJump then return end
+	if not infArmed then return end
+
+	infArmed = false
+
+	local now = os.clock()
+	if now - infLast < CONFIG.InfJumpCooldown then return end
+	infLast = now
+
+	local root = getHRP(getCharacter())
+	if not root then return end
+
+	local v = root.AssemblyLinearVelocity
+	root.AssemblyLinearVelocity = Vector3.new(v.X, CONFIG.InfJumpImpulse, v.Z)
+
+	task.delay(0.12, function()
+		infArmed = true
+	end)
+end))
+
+track(RunService.RenderStepped:Connect(function()
+	if not alive then return end
+
+	if typingInTextBox() then
+		if flying and flyVelocity then
+			flyVelocity.VectorVelocity = Vector3.zero
+		end
+		return
+	end
+
+	if flying and hrp and flyVelocity and flyOrientation then
+		local cam = workspace.CurrentCamera
+		local dir = Vector3.zero
+
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) then dir -= Vector3.yAxis end
+
+		if dir.Magnitude > 0 then
+			dir = dir.Unit
+		end
+
+		flyVelocity.VectorVelocity = dir * flySpeed
+		flyOrientation.CFrame = cam.CFrame
+	end
+
+end))
+
+
+
+-- This connection is in the admin menu's main connection bucket.
+-- The existing red X disconnects it along with the rest of the menu.
+track(RunService.RenderStepped:Connect(function()
+	if not alive or not aimLockEnabled then
+		return
+	end
+
+	-- Re-evaluate continuously so the closest valid controlled entity wins.
+	local targetEntity
+	local targetPosition
+	aimCurrentTarget, targetEntity, targetPosition = AimCore.findBestTarget()
+
+	if not aimCurrentTarget or not targetEntity or not targetPosition then
+		if aimTargetLabel then
+			aimTargetLabel.Text = "Target: None"
+			aimTargetLabel.TextColor3 = THEME.SUBTEXT
+		end
+		return
+	end
+
+	local char = aimCurrentTarget.Character
+
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return
+	end
+
+	local teamName = (aimCurrentTarget.Neutral == true or aimCurrentTarget.Team == nil)
+		and "Neutral"
+		or aimCurrentTarget.Team.Name
+
+	if aimTargetLabel then
+		aimTargetLabel.Text =
+			"Target: "
+			.. aimCurrentTarget.Name
+			.. " ["
+			.. teamName
+			.. "]"
+			.. (AimCore.isSeated(char) and " [VEHICLE]" or "")
+		aimTargetLabel.TextColor3 = THEME.ACCENT
+	end
+
+	-- Full-strength snap from the tested standalone version.
+	cam.CFrame = CFrame.lookAt(
+		cam.CFrame.Position,
+		targetPosition
+	)
+end))
+
+task.spawn(function()
+	while alive do
+		task.wait(0.1)
+		if espEnabled then
+			refreshAllESP()
+		end
+	end
+end)
+
+-- ===== PLAYER HOOKS =====
+track(Players.PlayerAdded:Connect(function(otherPlayer)
+	hookPlayer(otherPlayer)
+	if window and window.Visible then
+		rebuildPlayerList()
+	end
+end))
+
+track(Players.PlayerRemoving:Connect(function(otherPlayer)
+	unhookPlayer(otherPlayer)
+	if window and window.Visible then
+		rebuildPlayerList()
+	end
+end))
+
+track(player:GetPropertyChangedSignal("Team"):Connect(function()
+	if espEnabled then refreshAllESP() end
+
+	-- Default TARGET/IGNORE states depend on our own team. Refresh both the UI
+	-- and aim caches when Roblox changes it.
+	AimCore.reset()
+	task.defer(rebuildAimTeamButtons)
+
+	if aimCurrentTarget and not AimCore.targetAllowed(aimCurrentTarget) then
+		aimCurrentTarget = nil
+		updateAimlockUI()
+	end
+end))
+
+track(player:GetPropertyChangedSignal("Neutral"):Connect(function()
+	if espEnabled then refreshAllESP() end
+
+	AimCore.reset()
+	task.defer(rebuildAimTeamButtons)
+
+	if aimCurrentTarget and not AimCore.targetAllowed(aimCurrentTarget) then
+		aimCurrentTarget = nil
+		updateAimlockUI()
+	end
+end))
+
+for _, otherPlayer in ipairs(Players:GetPlayers()) do
+	hookPlayer(otherPlayer)
+end
+
+track(Teams.ChildAdded:Connect(function(child)
+	if child:IsA("Team") then
+		AimCore.reset()
+		task.defer(rebuildAimTeamButtons)
+	end
+end))
+
+track(Teams.ChildRemoved:Connect(function(child)
+	if child:IsA("Team") then
+		-- Keep the saved name-based preference in case the team is recreated.
+		AimCore.reset()
+		task.defer(rebuildAimTeamButtons)
+	end
+end))
+
+-- ===== CLEAN UNLOAD =====
+local unloading = false
+local function cleanupMenu()
+	if unloading then return end
+	unloading = true
+
+	-- Save preferences before alive flips false (debounced saves no longer run afterward).
+	saveSettingsNow()
+
+	setAimLockEnabled(false)
+	setFlying(false)
+	setNoclip(false)
+	infJump = false
+	stopBringingAll()
+	setGhostMode(false)
+	cleanupFlyObjects()
+	destroyGhost()
+
+	if ENH.KeyCaptureConnection then ENH.KeyCaptureConnection:Disconnect(); ENH.KeyCaptureConnection = nil end
+	ENH.CapturingKeybind = false
+
+	-- Hand WalkSpeed/JumpPower and camera ownership back to the game for this session.
+	restoreGameStats(false)
+
+	alive = false
+	disconnectBucket(ENH.DynamicPlayerConnections)
+	disconnectBucket(ENH.DynamicAimTeamConnections)
+	disconnectBucket(perCharacterConnections)
+	disconnectBucket(connections)
+
+	for otherPlayer, bucket in pairs(playerHooks) do
+		disconnectBucket(bucket)
+		playerHooks[otherPlayer] = nil
+	end
+
+	if gui and gui.Parent then gui:Destroy() end
+	if ENH.Env.r0onk_Unload == cleanupMenu then ENH.Env.r0onk_Unload = nil end
+	ENH.Env.r0onk_ToggleWindow = nil
+end
+
+ENH.Env.r0onk_Unload = cleanupMenu
+
+-- ===== STARTUP =====
+flySpeed = clampInt(flySpeed, CONFIG.FlySpeed.Min, CONFIG.FlySpeed.Max)
+walkSpeed = clampInt(walkSpeed, CONFIG.WalkSpeed.Min, CONFIG.WalkSpeed.Max)
+jumpPower = clampInt(jumpPower, CONFIG.JumpPower.Min, CONFIG.JumpPower.Max)
+espMaxDistance = clampInt(espMaxDistance, CONFIG.ESP.MaxDistanceMin, CONFIG.ESP.MaxDistanceMax)
+aimMaxDistance = clampInt(aimMaxDistance, CONFIG.AIMLOCK.MaxDistanceMin, CONFIG.AIMLOCK.MaxDistanceMax)
+buildWindow()
+
+if player.Character then
+	setupCharacter(player.Character)
+end
+
+track(player.CharacterAdded:Connect(function(char)
+	setupCharacter(char)
+end))
