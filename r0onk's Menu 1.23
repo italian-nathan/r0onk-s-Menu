@@ -164,6 +164,8 @@ local espMaxDistance = tonumber(ENH.GamePrefs.ESPMaxDistance) or CONFIG.ESP.MaxD
 local aimLockEnabled = false
 local aimCurrentTarget = nil
 local aimMaxDistance = tonumber(ENH.GamePrefs.AimMaxDistance) or CONFIG.AIMLOCK.MaxDistanceDefault
+local AIM_RENDER_BIND = "r0onk_AimLock"
+local aimRenderBound = false
 
 -- Only explicit user choices are stored here.
 -- Teams without an override fall back to the familiar behavior:
@@ -1883,6 +1885,7 @@ local aimResolvedCache = {}
 local aimLastEntityScan = -math.huge
 local aimEntityScanInProgress = false
 local aimExternalGeneration = 0
+local aimScanSerial = 0
 
 local AIM_CONTROL_LINK_KEYS = {
 	controlledentity = true,
@@ -2479,205 +2482,233 @@ end
 local function aimStartExternalScan(forceRefresh)
 	-- Performance-safe universal discovery.
 	--
-	-- IMPORTANT: this deliberately does NOT crawl workspace:GetDescendants().
-	-- Global scans created large queues/garbage and caused lingering frame drops.
-	--
-	-- Instead we only follow relationships that originate from each Player or
-	-- their Character, plus physical seat/assembly relationships. A proxy
-	-- character gets one name-based recursive lookup as a last-resort heuristic.
+	-- This never crawls workspace:GetDescendants(). Instead it follows relationships
+	-- originating from each Player/Character, plus seat/assembly links. The work is
+	-- deferred and yields in small chunks so target acquisition never performs the
+	-- discovery scan synchronously inside the render callback.
 	local now = os.clock()
+
+	if aimEntityScanInProgress then
+		return
+	end
 
 	if not forceRefresh and now - aimLastEntityScan < AIM_ENTITY_SCAN_INTERVAL then
 		return
 	end
 
 	aimLastEntityScan = now
+	aimEntityScanInProgress = true
+	aimScanSerial += 1
+	local scanSerial = aimScanSerial
 
-	local cache = {}
+	task.defer(function()
+		local ok, err = pcall(function()
+			local cache = {}
+			local workCount = 0
 
-	local function addReferencedEntity(otherPlayer, char, value, reason, score, force)
-		if typeof(value) ~= "Instance" then
-			return
-		end
-
-		local entity = aimInstanceToEntity(value)
-		if entity
-			and entity.Parent
-			and entity:IsDescendantOf(workspace)
-			and (not char or (entity ~= char and not entity:IsDescendantOf(char)))
-		then
-			aimAddExternalCandidate(
-				cache,
-				otherPlayer,
-				entity,
-				score,
-				force,
-				reason
-			)
-		end
-	end
-
-	local function tryNamedWorkspaceEntity(otherPlayer, char, name)
-		name = tostring(name or "")
-		if name == "" then
-			return
-		end
-
-		-- FindFirstChild(..., true) avoids allocating a full Workspace descendant
-		-- array. This path is only used for proxy/invisible Character setups.
-		local found = workspace:FindFirstChild(name, true)
-		if not found then
-			return
-		end
-
-		local entity = aimInstanceToEntity(found)
-		if entity
-			and entity.Parent
-			and entity ~= char
-			and (not char or not entity:IsDescendantOf(char))
-			and aimEntityLooksControllable(entity)
-		then
-			aimAddExternalCandidate(
-				cache,
-				otherPlayer,
-				entity,
-				45,
-				false,
-				"proxy-name-match"
-			)
-		end
-	end
-
-	for _, otherPlayer in ipairs(Players:GetPlayers()) do
-		cache[otherPlayer] = {}
-
-		local char = otherPlayer.Character
-		if char then
-			aimRememberCharacter(otherPlayer, char)
-		end
-
-		-- Explicit links attached to Player/Character are the strongest and most
-		-- portable custom-controller convention.
-		local roots = { otherPlayer }
-		if char then
-			table.insert(roots, char)
-		end
-
-		for _, root in ipairs(roots) do
-			for _, descendant in ipairs(root:GetDescendants()) do
-				local key = aimNormalizeKey(descendant.Name)
-
-				if descendant:IsA("ObjectValue") and descendant.Value then
-					if AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key) then
-						addReferencedEntity(
-							otherPlayer,
-							char,
-							descendant.Value,
-							"direct-control-reference",
-							125,
-							true
-						)
-					end
-
-				elseif descendant:IsA("StringValue")
-					and (AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key))
-				then
-					local modelName = descendant.Value
-					if modelName ~= "" then
-						local found = workspace:FindFirstChild(modelName, true)
-						if found then
-							addReferencedEntity(
-								otherPlayer,
-								char,
-								found,
-								"direct-control-name",
-								115,
-								true
-							)
-						end
-					end
+			local function scanPulse(amount)
+				workCount += amount or 1
+				if workCount >= AIM_SCAN_CHUNK then
+					workCount = 0
+					task.wait()
 				end
 			end
 
-			for attrName, attrValue in pairs(root:GetAttributes()) do
-				local key = aimNormalizeKey(attrName)
-				if typeof(attrValue) == "string"
-					and (AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key))
-					and attrValue ~= ""
-				then
-					local found = workspace:FindFirstChild(attrValue, true)
-					if found then
-						addReferencedEntity(
-							otherPlayer,
-							char,
-							found,
-							"direct-control-attribute",
-							115,
-							true
-						)
-					end
+			local function addReferencedEntity(otherPlayer, char, value, reason, score, force)
+				if typeof(value) ~= "Instance" then
+					return
 				end
-			end
-		end
 
-		if char then
-			local hum = aimGetHumanoidDeep(char)
-
-			-- Seat relationship: supports standard vehicles and custom vehicle
-			-- models without searching the rest of Workspace.
-			if hum and hum.SeatPart then
-				local seatEntity = aimMarkerContainer(hum.SeatPart)
-				if seatEntity and seatEntity ~= char then
+				local entity = aimInstanceToEntity(value)
+				if entity
+					and entity.Parent
+					and entity:IsDescendantOf(workspace)
+					and (not char or (entity ~= char and not entity:IsDescendantOf(char)))
+				then
 					aimAddExternalCandidate(
 						cache,
 						otherPlayer,
-						seatEntity,
-						95,
-						false,
-						"seat-occupant"
+						entity,
+						score,
+						force,
+						reason
 					)
 				end
 			end
 
-			-- Physically attached external morphs/mechs/shells.
-			local rootPart = hum and hum.RootPart or char.PrimaryPart
-			if rootPart and rootPart:IsA("BasePart") then
-				local ok, connectedParts = pcall(function()
-					return rootPart:GetConnectedParts(true)
-				end)
+			local function tryNamedWorkspaceEntity(otherPlayer, char, name)
+				name = tostring(name or "")
+				if name == "" then
+					return
+				end
 
-				if ok then
-					for _, connectedPart in ipairs(connectedParts) do
-						if connectedPart.Parent
-							and not connectedPart:IsDescendantOf(char)
+				-- Only proxy/invisible Character setups use this weaker recursive lookup.
+				local found = workspace:FindFirstChild(name, true)
+				if not found then
+					return
+				end
+
+				local entity = aimInstanceToEntity(found)
+				if entity
+					and entity.Parent
+					and entity ~= char
+					and (not char or not entity:IsDescendantOf(char))
+					and aimEntityLooksControllable(entity)
+				then
+					aimAddExternalCandidate(
+						cache,
+						otherPlayer,
+						entity,
+						45,
+						false,
+						"proxy-name-match"
+					)
+				end
+			end
+
+			for _, otherPlayer in ipairs(Players:GetPlayers()) do
+				if scanSerial ~= aimScanSerial then return end
+				cache[otherPlayer] = {}
+
+				local char = otherPlayer.Character
+				if char then
+					aimRememberCharacter(otherPlayer, char)
+				end
+
+				local roots = { otherPlayer }
+				if char then
+					table.insert(roots, char)
+				end
+
+				for _, root in ipairs(roots) do
+					for _, descendant in ipairs(root:GetDescendants()) do
+						if scanSerial ~= aimScanSerial then return end
+						local key = aimNormalizeKey(descendant.Name)
+
+						if descendant:IsA("ObjectValue") and descendant.Value then
+							if AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key) then
+								addReferencedEntity(
+									otherPlayer,
+									char,
+									descendant.Value,
+									"direct-control-reference",
+									125,
+									true
+								)
+							end
+
+						elseif descendant:IsA("StringValue")
+							and (AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key))
 						then
+							local modelName = descendant.Value
+							if modelName ~= "" then
+								local found = workspace:FindFirstChild(modelName, true)
+								if found then
+									addReferencedEntity(
+										otherPlayer,
+										char,
+										found,
+										"direct-control-name",
+										115,
+										true
+									)
+								end
+							end
+						end
+
+						scanPulse()
+					end
+
+					for attrName, attrValue in pairs(root:GetAttributes()) do
+						if scanSerial ~= aimScanSerial then return end
+						local key = aimNormalizeKey(attrName)
+						if typeof(attrValue) == "string"
+							and (AIM_CONTROL_LINK_KEYS[key] or aimKeyImpliesActiveControl(key))
+							and attrValue ~= ""
+						then
+							local found = workspace:FindFirstChild(attrValue, true)
+							if found then
+								addReferencedEntity(
+									otherPlayer,
+									char,
+									found,
+									"direct-control-attribute",
+									115,
+									true
+								)
+							end
+						end
+						scanPulse()
+					end
+				end
+
+				if char then
+					local hum = aimGetHumanoidDeep(char)
+
+					if hum and hum.SeatPart then
+						local seatEntity = aimMarkerContainer(hum.SeatPart)
+						if seatEntity and seatEntity ~= char then
 							aimAddExternalCandidate(
 								cache,
 								otherPlayer,
-								connectedPart,
-								70,
+								seatEntity,
+								95,
 								false,
-								"connected-assembly"
+								"seat-occupant"
 							)
 						end
 					end
+
+					local rootPart = hum and hum.RootPart or char.PrimaryPart
+					if rootPart and rootPart:IsA("BasePart") then
+						local connectedOK, connectedParts = pcall(function()
+							return rootPart:GetConnectedParts(true)
+						end)
+
+						if connectedOK then
+							for _, connectedPart in ipairs(connectedParts) do
+								if scanSerial ~= aimScanSerial then return end
+								if connectedPart.Parent
+									and not connectedPart:IsDescendantOf(char)
+								then
+									aimAddExternalCandidate(
+										cache,
+										otherPlayer,
+										connectedPart,
+										70,
+										false,
+										"connected-assembly"
+									)
+								end
+								scanPulse()
+							end
+						end
+					end
+
+					if aimCharacterLooksLikeProxySlow(char) then
+						tryNamedWorkspaceEntity(otherPlayer, char, otherPlayer.Name)
+
+						if otherPlayer.DisplayName ~= otherPlayer.Name then
+							tryNamedWorkspaceEntity(otherPlayer, char, otherPlayer.DisplayName)
+						end
+					end
 				end
+
+				scanPulse(5)
 			end
 
-			-- Only proxy/invisible Character setups get the weak name heuristic.
-			-- Normal R6/R15/custom visible characters never touch this path.
-			if aimCharacterLooksLikeProxySlow(char) then
-				tryNamedWorkspaceEntity(otherPlayer, char, otherPlayer.Name)
+			if scanSerial ~= aimScanSerial then return end
+			aimExternalEntityCache = cache
+			aimExternalGeneration += 1
+		end)
 
-				if otherPlayer.DisplayName ~= otherPlayer.Name then
-					tryNamedWorkspaceEntity(otherPlayer, char, otherPlayer.DisplayName)
-				end
+		if scanSerial == aimScanSerial then
+			aimEntityScanInProgress = false
+			if not ok then
+				warn("[r0onk Aim] external scan failed:", err)
 			end
 		end
-	end
-
-	aimExternalEntityCache = cache
-	aimExternalGeneration += 1
+	end)
 end
 
 local function aimBestExternalEntity(otherPlayer, minimumScore, forceOnly)
@@ -2921,7 +2952,8 @@ local function aimResolveTarget(otherPlayer)
 end
 
 local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
-	local char = otherPlayer and otherPlayer.Character or nil
+	local targetChar = otherPlayer and otherPlayer.Character or nil
+	local myChar = getCharacter()
 	local cam = workspace.CurrentCamera
 	if not cam then return false end
 
@@ -2932,7 +2964,11 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.IgnoreWater = true
-	params.RespectCanCollide = false
+
+	-- Use physical collision as the visibility rule. This prevents decorative,
+	-- trigger, query-only and other non-collidable helper parts from falsely
+	-- blocking a target while real walls/terrain still block it.
+	params.RespectCanCollide = true
 
 	local exclude = {}
 	local seen = {}
@@ -2943,24 +2979,43 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 		end
 	end
 
-	addExclude(targetEntity)
-	addExclude(char)
-	addExclude(getCharacter())
+	local function addSeatAssembly(seat)
+		if not seat or not seat:IsA("BasePart") then return end
 
-	-- When a target is seated, ignore the vehicle they are physically attached to,
-	-- but DO NOT bypass the raycast. Real walls/terrain must still block aim.
-	if char then
-		local hum = aimGetHumanoidDeep(char)
-		local seat = hum and hum.SeatPart or nil
-		if seat then
-			local vehicleModel = seat:FindFirstAncestorOfClass("Model")
-			addExclude(vehicleModel or seat)
+		addExclude(seat)
 
-			local ok, connected = pcall(function() return seat:GetConnectedParts(true) end)
-			if ok then
-				for _, part in ipairs(connected) do addExclude(part) end
+		-- Ignore the containing vehicle model as well as the actual connected
+		-- physics assembly. ConnectedParts covers oddly nested/custom vehicles.
+		local vehicleModel = seat:FindFirstAncestorOfClass("Model")
+		if vehicleModel then
+			addExclude(vehicleModel)
+		end
+
+		local ok, connected = pcall(function()
+			return seat:GetConnectedParts(true)
+		end)
+		if ok then
+			for _, part in ipairs(connected) do
+				addExclude(part)
 			end
 		end
+	end
+
+	addExclude(targetEntity)
+	addExclude(targetChar)
+	addExclude(myChar)
+
+	-- Target vehicle must not hide its occupant from LOS.
+	if targetChar then
+		local targetHum = aimGetHumanoidDeep(targetChar)
+		addSeatAssembly(targetHum and targetHum.SeatPart or nil)
+	end
+
+	-- Our own windshield/chassis/seat must not block a ray that starts from the
+	-- camera while we are driving or sitting in a custom vehicle.
+	if myChar then
+		local myHum = aimGetHumanoidDeep(myChar)
+		addSeatAssembly(myHum and myHum.SeatPart or nil)
 	end
 
 	params.FilterDescendantsInstances = exclude
@@ -3006,12 +3061,13 @@ local function aimFindBestTarget()
 		return nil, nil, nil
 	end
 
-	-- This is only a cheap interval/in-progress check. Actual Workspace discovery
-	-- happens in a chunked task and never blocks this render frame.
+	-- This call only schedules discovery when the cache is stale. The expensive
+	-- work itself is deferred/yielded by aimStartExternalScan.
 	aimStartExternalScan(false)
 
 	local cameraPosition = cam.CFrame.Position
 	local minimumDot = math.cos(math.rad(CONFIG.AIMLOCK.FOVDegrees))
+	local viewportCenter = Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
 	local candidates = {}
 
 	for _, otherPlayer in ipairs(Players:GetPlayers()) do
@@ -3026,8 +3082,8 @@ local function aimFindBestTarget()
 			continue
 		end
 
-		-- Hard policy gate after resolution too. This makes team/Neutral changes
-		-- authoritative even if they happen while a cached vehicle/proxy is live.
+		-- Team/Neutral policy is checked again after resolution so cached proxies or
+		-- vehicles can never bypass a newly changed TARGET/IGNORE setting.
 		if not aimTargetAllowed(otherPlayer) then
 			continue
 		end
@@ -3050,23 +3106,30 @@ local function aimFindBestTarget()
 			continue
 		end
 
+		local screenPoint = Vector2.new(screenPosition.X, screenPosition.Y)
+		local crosshairDistance = (screenPoint - viewportCenter).Magnitude
+
 		table.insert(candidates, {
 			player = otherPlayer,
 			entity = resolved.entity,
 			position = targetPosition,
 			distance = distance,
+			crosshairDistance = crosshairDistance,
 		})
 	end
 
-	-- Sort by true world distance first, then raycast from nearest outward.
-	-- In the common case this means ONE raycast per frame instead of one per player.
+	-- Aim assist should prefer what the player is actually aiming near, not simply
+	-- whichever valid person happens to be physically closest in the world.
+	-- World distance is only the tiebreaker for nearly identical screen positions.
 	table.sort(candidates, function(a, b)
+		local screenDelta = a.crosshairDistance - b.crosshairDistance
+		if math.abs(screenDelta) > 0.5 then
+			return screenDelta < 0
+		end
 		return a.distance < b.distance
 	end)
 
 	for _, candidate in ipairs(candidates) do
-		-- Final live re-check prevents a player who changed team/Neutral state during
-		-- this frame from slipping through a previously built candidate entry.
 		if aimTargetAllowed(candidate.player)
 			and aimHasLineOfSight(candidate.entity, candidate.position, candidate.player)
 		then
@@ -3083,6 +3146,7 @@ local function aimGetPosition(entity)
 end
 
 	local function aimReset()
+		aimScanSerial += 1 -- Cancels any deferred scan that was built from stale state.
 		table.clear(aimExternalEntityCache)
 		table.clear(aimResolvedCache)
 		table.clear(aimCharacterHistory)
@@ -4401,14 +4465,13 @@ end))
 
 
 
--- This connection is in the admin menu's main connection bucket.
--- The existing red X disconnects it along with the rest of the menu.
-track(RunService.RenderStepped:Connect(function()
+-- Run the aim camera pass at a late render priority so normal/custom camera
+-- controllers do not immediately overwrite the snap in the same frame.
+local function updateAimCamera()
 	if not alive or not aimLockEnabled then
 		return
 	end
 
-	-- Re-evaluate continuously so the closest valid controlled entity wins.
 	local targetEntity
 	local targetPosition
 	aimCurrentTarget, targetEntity, targetPosition = AimCore.findBestTarget()
@@ -4422,7 +4485,6 @@ track(RunService.RenderStepped:Connect(function()
 	end
 
 	local char = aimCurrentTarget.Character
-
 	local cam = workspace.CurrentCamera
 	if not cam then
 		return
@@ -4443,12 +4505,27 @@ track(RunService.RenderStepped:Connect(function()
 		aimTargetLabel.TextColor3 = THEME.ACCENT
 	end
 
-	-- Full-strength snap from the tested standalone version.
-	cam.CFrame = CFrame.lookAt(
-		cam.CFrame.Position,
-		targetPosition
+	cam.CFrame = CFrame.lookAt(cam.CFrame.Position, targetPosition)
+end
+
+pcall(function()
+	RunService:UnbindFromRenderStep(AIM_RENDER_BIND)
+end)
+
+local bindOK = pcall(function()
+	RunService:BindToRenderStep(
+		AIM_RENDER_BIND,
+		Enum.RenderPriority.Last.Value,
+		updateAimCamera
 	)
-end))
+end)
+aimRenderBound = bindOK
+
+-- Extremely old/unusual environments can reject BindToRenderStep. Keep a
+-- normal tracked RenderStepped fallback rather than leaving aim silently dead.
+if not bindOK then
+	track(RunService.RenderStepped:Connect(updateAimCamera))
+end
 
 task.spawn(function()
 	while alive do
@@ -4536,6 +4613,11 @@ local function cleanupMenu()
 	setGhostMode(false)
 	cleanupFlyObjects()
 	destroyGhost()
+
+	if aimRenderBound then
+		pcall(function() RunService:UnbindFromRenderStep(AIM_RENDER_BIND) end)
+		aimRenderBound = false
+	end
 
 	if ENH.KeyCaptureConnection then ENH.KeyCaptureConnection:Disconnect(); ENH.KeyCaptureConnection = nil end
 	ENH.CapturingKeybind = false
