@@ -2965,17 +2965,65 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.IgnoreWater = true
 
-	-- Use physical collision as the visibility rule. This prevents decorative,
-	-- trigger, query-only and other non-collidable helper parts from falsely
-	-- blocking a target while real walls/terrain still block it.
+	-- Physical collision is still the visibility rule. Only the vehicle/assembly a
+	-- seated character is attached to becomes transparent; map walls and terrain
+	-- remain real blockers.
 	params.RespectCanCollide = true
 
 	local exclude = {}
 	local seen = {}
 	local function addExclude(instance)
-		if instance and not seen[instance] then
+		if instance and instance ~= workspace and not seen[instance] then
 			seen[instance] = true
 			table.insert(exclude, instance)
+		end
+	end
+
+	local function modelLooksVehicleSized(model, anchorPosition, isImmediate)
+		if not model or not model:IsA("Model") then
+			return false
+		end
+
+		local ok, cf, size = pcall(function()
+			local boxCF, boxSize = model:GetBoundingBox()
+			return boxCF, boxSize
+		end)
+
+		-- Always be conservative about higher ancestors so a vehicle nested inside
+		-- a large Map model can never make the whole map invisible to LOS.
+		if not ok then
+			return isImmediate == true
+		end
+
+		local maxAxis = math.max(size.X, size.Y, size.Z)
+		local centerDistance = (cf.Position - anchorPosition).Magnitude
+
+		if isImmediate then
+			return maxAxis <= 260 and centerDistance <= 160
+		end
+
+		return maxAxis <= 180 and centerDistance <= 110
+	end
+
+	local function addBoundedModelHierarchy(part, anchorPosition, maxDepth)
+		if not part or not part:IsA("BasePart") then return end
+
+		local model = part:FindFirstAncestorOfClass("Model")
+		local depth = 0
+		while model and depth < (maxDepth or 4) do
+			depth += 1
+			if not modelLooksVehicleSized(model, anchorPosition, depth == 1) then
+				break
+			end
+
+			addExclude(model)
+
+			local parent = model.Parent
+			if parent and parent:IsA("Model") then
+				model = parent
+			else
+				break
+			end
 		end
 	end
 
@@ -2984,19 +3032,63 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 
 		addExclude(seat)
 
-		-- Ignore the containing vehicle model as well as the actual connected
-		-- physics assembly. ConnectedParts covers oddly nested/custom vehicles.
-		local vehicleModel = seat:FindFirstAncestorOfClass("Model")
-		if vehicleModel then
-			addExclude(vehicleModel)
-		end
-
-		local ok, connected = pcall(function()
+		-- Normal Roblox vehicles: SeatPart is welded/constraint-connected to the
+		-- chassis. Ignore that entire connected physics assembly.
+		local okConnected, connected = pcall(function()
 			return seat:GetConnectedParts(true)
 		end)
-		if ok then
+		if okConnected then
 			for _, part in ipairs(connected) do
 				addExclude(part)
+			end
+		end
+
+		local assemblyRoot = seat.AssemblyRootPart
+		if assemblyRoot then
+			addExclude(assemblyRoot)
+		end
+
+		-- Vehicle body/cabin pieces are often nested or anchored and therefore NOT
+		-- returned by GetConnectedParts. Include the small model hierarchy around the
+		-- seat and assembly root as well.
+		addBoundedModelHierarchy(seat, seat.Position, 4)
+		if assemblyRoot then
+			addBoundedModelHierarchy(assemblyRoot, seat.Position, 3)
+		end
+	end
+
+	local function addSeatedCharacterVehicle(char)
+		if not char then return end
+
+		local hum = aimGetHumanoidDeep(char)
+		if not hum then return end
+
+		local seat = hum.SeatPart
+		if seat then
+			addSeatAssembly(seat)
+			return
+		end
+
+		-- Custom-seat fallback: some games set Humanoid.Sit / weld the avatar into a
+		-- vehicle but never replicate a real SeatPart to the client. Follow physical
+		-- connections from the character root and treat ONLY external connected parts
+		-- (plus their bounded model hierarchy) as the vehicle.
+		if hum.Sit ~= true then return end
+
+		local root = hum.RootPart
+			or char:FindFirstChild("HumanoidRootPart", true)
+			or char.PrimaryPart
+		if not root or not root:IsA("BasePart") then return end
+
+		local okConnected, connected = pcall(function()
+			return root:GetConnectedParts(true)
+		end)
+		if not okConnected then return end
+
+		for _, part in ipairs(connected) do
+			if part:IsA("BasePart") and not part:IsDescendantOf(char) then
+				addExclude(part)
+				addBoundedModelHierarchy(part, root.Position, 3)
 			end
 		end
 	end
@@ -3005,18 +3097,11 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 	addExclude(targetChar)
 	addExclude(myChar)
 
-	-- Target vehicle must not hide its occupant from LOS.
-	if targetChar then
-		local targetHum = aimGetHumanoidDeep(targetChar)
-		addSeatAssembly(targetHum and targetHum.SeatPart or nil)
-	end
+	-- The target's car/cabin should never hide the seated target from the aimbot.
+	addSeatedCharacterVehicle(targetChar)
 
-	-- Our own windshield/chassis/seat must not block a ray that starts from the
-	-- camera while we are driving or sitting in a custom vehicle.
-	if myChar then
-		local myHum = aimGetHumanoidDeep(myChar)
-		addSeatAssembly(myHum and myHum.SeatPart or nil)
-	end
+	-- Same for our own car so a windshield/chassis cannot intercept the camera ray.
+	addSeatedCharacterVehicle(myChar)
 
 	params.FilterDescendantsInstances = exclude
 	return workspace:Raycast(origin, direction, params) == nil
