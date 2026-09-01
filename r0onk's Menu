@@ -1882,6 +1882,12 @@ local AIM_SCAN_CHUNK = 50
 local aimExternalEntityCache = {}
 local aimCharacterHistory = {}
 local aimResolvedCache = {}
+
+-- Cached vehicle/seat LOS exclusions. Helicopters and other complex vehicles can
+-- contain hundreds or thousands of connected parts, so this cache prevents
+-- GetConnectedParts()/GetBoundingBox() work from happening every render frame.
+local aimVehicleLosCache = setmetatable({}, { __mode = "k" })
+
 local aimLastEntityScan = -math.huge
 local aimEntityScanInProgress = false
 local aimExternalGeneration = 0
@@ -2644,9 +2650,10 @@ local function aimStartExternalScan(forceRefresh)
 
 				if char then
 					local hum = aimGetHumanoidDeep(char)
+					local realSeat = hum and hum.SeatPart or nil
 
-					if hum and hum.SeatPart then
-						local seatEntity = aimMarkerContainer(hum.SeatPart)
+					if realSeat then
+						local seatEntity = aimMarkerContainer(realSeat)
 						if seatEntity and seatEntity ~= char then
 							aimAddExternalCandidate(
 								cache,
@@ -2659,28 +2666,35 @@ local function aimStartExternalScan(forceRefresh)
 						end
 					end
 
-					local rootPart = hum and hum.RootPart or char.PrimaryPart
-					if rootPart and rootPart:IsA("BasePart") then
-						local connectedOK, connectedParts = pcall(function()
-							return rootPart:GetConnectedParts(true)
-						end)
+					-- IMPORTANT PERFORMANCE RULE:
+					-- A real SeatPart already gives us the vehicle relationship directly.
+					-- Walking RootPart:GetConnectedParts(true) as well is redundant and can
+					-- explode in cost on helicopters/aircraft with huge welded assemblies.
+					-- Keep connected-assembly discovery only as a fallback for custom seats.
+					if not realSeat then
+						local rootPart = hum and hum.RootPart or char.PrimaryPart
+						if rootPart and rootPart:IsA("BasePart") then
+							local connectedOK, connectedParts = pcall(function()
+								return rootPart:GetConnectedParts(true)
+							end)
 
-						if connectedOK then
-							for _, connectedPart in ipairs(connectedParts) do
-								if scanSerial ~= aimScanSerial then return end
-								if connectedPart.Parent
-									and not connectedPart:IsDescendantOf(char)
-								then
-									aimAddExternalCandidate(
-										cache,
-										otherPlayer,
-										connectedPart,
-										70,
-										false,
-										"connected-assembly"
-									)
+							if connectedOK then
+								for _, connectedPart in ipairs(connectedParts) do
+									if scanSerial ~= aimScanSerial then return end
+									if connectedPart.Parent
+										and not connectedPart:IsDescendantOf(char)
+									then
+										aimAddExternalCandidate(
+											cache,
+											otherPlayer,
+											connectedPart,
+											70,
+											false,
+											"connected-assembly"
+										)
+									end
+									scanPulse()
 								end
-								scanPulse()
 							end
 						end
 					end
@@ -2951,34 +2965,62 @@ local function aimResolveTarget(otherPlayer)
 	return aimResolvedCache[otherPlayer]
 end
 
-local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
-	local targetChar = otherPlayer and otherPlayer.Character or nil
-	local myChar = getCharacter()
-	local cam = workspace.CurrentCamera
-	if not cam then return false end
+local function aimGetVehicleLosExcludes(char)
+	if not char or not char.Parent then
+		return nil
+	end
 
-	local origin = cam.CFrame.Position
-	local direction = targetPosition - origin
-	if direction.Magnitude <= 0 then return true end
+	local cached = aimVehicleLosCache[char]
+	local hum = cached and cached.humanoid or nil
+	if not hum or not hum.Parent then
+		hum = aimGetHumanoidDeep(char)
+	end
 
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.IgnoreWater = true
+	if not hum then
+		aimVehicleLosCache[char] = nil
+		return nil
+	end
 
-	-- Physical collision is still the visibility rule. Only the vehicle/assembly a
-	-- seated character is attached to becomes transparent; map walls and terrain
-	-- remain real blockers.
-	params.RespectCanCollide = true
+	local seat = hum.SeatPart
+	local sitState = hum.Sit == true
 
-	local exclude = {}
-	local seen = {}
-	local function addExclude(instance)
-		if instance and instance ~= workspace and not seen[instance] then
-			seen[instance] = true
-			table.insert(exclude, instance)
+	if not seat and not sitState then
+		aimVehicleLosCache[char] = nil
+		return nil
+	end
+
+	-- Fast path: seating relationship is unchanged and all cached containers still
+	-- exist. This is the path used every render frame after the first seated frame.
+	if cached
+		and cached.humanoid == hum
+		and cached.seat == seat
+		and cached.sitState == sitState
+	then
+		local valid = true
+		for _, instance in ipairs(cached.instances) do
+			if not instance or not instance.Parent then
+				valid = false
+				break
+			end
+		end
+
+		if valid then
+			return cached.instances
 		end
 	end
 
+	local instances = {}
+	local seen = {}
+
+	local function add(instance)
+		if instance and instance ~= workspace and not seen[instance] then
+			seen[instance] = true
+			table.insert(instances, instance)
+		end
+	end
+
+	-- This expensive geometry check is allowed ONLY while rebuilding the cache,
+	-- never once-per-frame. It prevents us from excluding a giant Map ancestor.
 	local function modelLooksVehicleSized(model, anchorPosition, isImmediate)
 		if not model or not model:IsA("Model") then
 			return false
@@ -2989,8 +3031,6 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 			return boxCF, boxSize
 		end)
 
-		-- Always be conservative about higher ancestors so a vehicle nested inside
-		-- a large Map model can never make the whole map invisible to LOS.
 		if not ok then
 			return isImmediate == true
 		end
@@ -3005,18 +3045,24 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 		return maxAxis <= 180 and centerDistance <= 110
 	end
 
-	local function addBoundedModelHierarchy(part, anchorPosition, maxDepth)
-		if not part or not part:IsA("BasePart") then return end
+	local function addModelHierarchy(part, anchorPosition, maxDepth)
+		if not part or not part:IsA("BasePart") then
+			return false
+		end
 
 		local model = part:FindFirstAncestorOfClass("Model")
 		local depth = 0
+		local addedModel = false
+
 		while model and depth < (maxDepth or 4) do
 			depth += 1
+
 			if not modelLooksVehicleSized(model, anchorPosition, depth == 1) then
 				break
 			end
 
-			addExclude(model)
+			add(model)
+			addedModel = true
 
 			local parent = model.Parent
 			if parent and parent:IsA("Model") then
@@ -3025,71 +3071,81 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 				break
 			end
 		end
+
+		return addedModel
 	end
 
-	local function addSeatAssembly(seat)
-		if not seat or not seat:IsA("BasePart") then return end
-
-		addExclude(seat)
-
-		-- Normal Roblox vehicles: SeatPart is welded/constraint-connected to the
-		-- chassis. Ignore that entire connected physics assembly.
-		local okConnected, connected = pcall(function()
-			return seat:GetConnectedParts(true)
-		end)
-		if okConnected then
-			for _, part in ipairs(connected) do
-				addExclude(part)
-			end
-		end
+	if seat and seat:IsA("BasePart") then
+		-- Normal Roblox vehicle path. The seat/model hierarchy is enough for raycast
+		-- filtering; DO NOT enumerate every welded helicopter part here.
+		add(seat)
 
 		local assemblyRoot = seat.AssemblyRootPart
 		if assemblyRoot then
-			addExclude(assemblyRoot)
+			add(assemblyRoot)
 		end
 
-		-- Vehicle body/cabin pieces are often nested or anchored and therefore NOT
-		-- returned by GetConnectedParts. Include the small model hierarchy around the
-		-- seat and assembly root as well.
-		addBoundedModelHierarchy(seat, seat.Position, 4)
+		addModelHierarchy(seat, seat.Position, 4)
 		if assemblyRoot then
-			addBoundedModelHierarchy(assemblyRoot, seat.Position, 3)
+			addModelHierarchy(assemblyRoot, seat.Position, 3)
 		end
-	end
-
-	local function addSeatedCharacterVehicle(char)
-		if not char then return end
-
-		local hum = aimGetHumanoidDeep(char)
-		if not hum then return end
-
-		local seat = hum.SeatPart
-		if seat then
-			addSeatAssembly(seat)
-			return
-		end
-
-		-- Custom-seat fallback: some games set Humanoid.Sit / weld the avatar into a
-		-- vehicle but never replicate a real SeatPart to the client. Follow physical
-		-- connections from the character root and treat ONLY external connected parts
-		-- (plus their bounded model hierarchy) as the vehicle.
-		if hum.Sit ~= true then return end
-
+	elseif sitState then
+		-- Custom-seat fallback. This may require one connected-parts query, but it is
+		-- cached for the entire seating relationship rather than repeated every frame.
 		local root = hum.RootPart
 			or char:FindFirstChild("HumanoidRootPart", true)
 			or char.PrimaryPart
-		if not root or not root:IsA("BasePart") then return end
 
-		local okConnected, connected = pcall(function()
-			return root:GetConnectedParts(true)
-		end)
-		if not okConnected then return end
+		if root and root:IsA("BasePart") then
+			local okConnected, connected = pcall(function()
+				return root:GetConnectedParts(true)
+			end)
 
-		for _, part in ipairs(connected) do
-			if part:IsA("BasePart") and not part:IsDescendantOf(char) then
-				addExclude(part)
-				addBoundedModelHierarchy(part, root.Position, 3)
+			if okConnected then
+				for _, part in ipairs(connected) do
+					if part:IsA("BasePart") and not part:IsDescendantOf(char) then
+						if not addModelHierarchy(part, root.Position, 3) then
+							add(part)
+						end
+					end
+				end
 			end
+		end
+	end
+
+	cached = {
+		humanoid = hum,
+		seat = seat,
+		sitState = sitState,
+		instances = instances,
+	}
+	aimVehicleLosCache[char] = cached
+
+	return instances
+end
+
+local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
+	local targetChar = otherPlayer and otherPlayer.Character or nil
+	local myChar = getCharacter()
+	local cam = workspace.CurrentCamera
+	if not cam then return false end
+
+	local origin = cam.CFrame.Position
+	local direction = targetPosition - origin
+	if direction.Magnitude <= 0 then return true end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	params.RespectCanCollide = true
+
+	local exclude = {}
+	local seen = {}
+
+	local function addExclude(instance)
+		if instance and instance ~= workspace and not seen[instance] then
+			seen[instance] = true
+			table.insert(exclude, instance)
 		end
 	end
 
@@ -3097,11 +3153,22 @@ local function aimHasLineOfSight(targetEntity, targetPosition, otherPlayer)
 	addExclude(targetChar)
 	addExclude(myChar)
 
-	-- The target's car/cabin should never hide the seated target from the aimbot.
-	addSeatedCharacterVehicle(targetChar)
+	-- These are tiny cached lists after the first frame of a seating relationship.
+	-- A giant helicopter no longer causes GetConnectedParts/GetBoundingBox every
+	-- time the render-step aimbot performs a visibility ray.
+	local targetVehicleExcludes = aimGetVehicleLosExcludes(targetChar)
+	if targetVehicleExcludes then
+		for _, instance in ipairs(targetVehicleExcludes) do
+			addExclude(instance)
+		end
+	end
 
-	-- Same for our own car so a windshield/chassis cannot intercept the camera ray.
-	addSeatedCharacterVehicle(myChar)
+	local myVehicleExcludes = aimGetVehicleLosExcludes(myChar)
+	if myVehicleExcludes then
+		for _, instance in ipairs(myVehicleExcludes) do
+			addExclude(instance)
+		end
+	end
 
 	params.FilterDescendantsInstances = exclude
 	return workspace:Raycast(origin, direction, params) == nil
@@ -3235,6 +3302,7 @@ end
 		table.clear(aimExternalEntityCache)
 		table.clear(aimResolvedCache)
 		table.clear(aimCharacterHistory)
+		table.clear(aimVehicleLosCache)
 		aimLastEntityScan = -math.huge
 		aimEntityScanInProgress = false
 		aimExternalGeneration += 1
